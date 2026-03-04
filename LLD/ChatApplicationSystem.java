@@ -1,9 +1,18 @@
+import java.util.*;
+
 public class ChatServiceApp {
 
     /* =========================
      *  Presence
      * ========================= */
     enum Presence { ONLINE, OFFLINE }
+
+    /* =========================
+     *  Presence Notification (Observer)
+     * ========================= */
+    interface PresenceObserver {
+        void onPresenceChanged(User target, Presence newPresence, User watcher);
+    }
 
     /* =========================
      *  Encryption (Strategy)
@@ -28,7 +37,7 @@ public class ChatServiceApp {
             if (cipherText.startsWith(PREFIX) && cipherText.endsWith(SUFFIX) && cipherText.length() > PREFIX.length() + 1) {
                 return cipherText.substring(PREFIX.length(), cipherText.length() - SUFFIX.length());
             }
-            return cipherText; // if not wrapped, return as-is
+            return cipherText;
         }
     }
 
@@ -64,8 +73,6 @@ public class ChatServiceApp {
         protected final EncryptionStrategy encryption;
 
         protected MessageObserver observer;
-
-        // Per-recipient state (important for group chat correctness)
         private final Map<String, MessageState> stateByRecipientId = new HashMap<>();
 
         protected AbstractMessage(String id,
@@ -79,7 +86,6 @@ public class ChatServiceApp {
             this.encryption = Objects.requireNonNull(encryption);
             this.encryptedContent = this.encryption.encrypt(plainContent);
 
-            // initialize state for each recipient
             for (User r : this.recipients) {
                 stateByRecipientId.put(r.getUserId(), MessageState.SENT);
             }
@@ -109,7 +115,6 @@ public class ChatServiceApp {
             String rid = recipient.getUserId();
             if (!stateByRecipientId.containsKey(rid)) return;
 
-            // only transition if not already SEEN (avoid double notifications)
             if (stateByRecipientId.get(rid) != MessageState.SEEN) {
                 stateByRecipientId.put(rid, MessageState.SEEN);
                 if (observer != null) observer.onSeen(this, recipient);
@@ -160,7 +165,6 @@ public class ChatServiceApp {
 
         private void attachSeenObserver(User sender, Message message) {
             message.setObserver((msg, seenBy) -> {
-                // requirement: "message notification sender user saw"
                 System.out.println("🔔 Notification to " + sender.getUsername()
                         + ": " + seenBy.getUsername()
                         + " saw your " + msg.getType()
@@ -243,10 +247,25 @@ public class ChatServiceApp {
         private final Map<String, Group> groups = new HashMap<>();
         private final Map<String, Presence> presence = new HashMap<>();
 
+        // key = targetUserId, value = set of watcherUserIds
+        private final Map<String, Set<String>> followers = new HashMap<>();
+
+        private final List<PresenceObserver> presenceObservers = new ArrayList<>();
+
         private final MessageFactory messageFactory;
 
         ChatService() {
             this.messageFactory = new MessageFactory(new StubEncryption());
+
+            // default presence observer (prints notification)
+            addPresenceObserver((target, newPresence, watcher) -> {
+                System.out.println("🔔 Notification to " + watcher.getUsername()
+                        + ": " + target.getUsername() + " is now " + newPresence);
+            });
+        }
+
+        void addPresenceObserver(PresenceObserver observer) {
+            presenceObservers.add(observer);
         }
 
         // onboarding
@@ -254,14 +273,35 @@ public class ChatServiceApp {
             User u = new User(userId, username);
             users.put(userId, u);
             presence.put(userId, Presence.OFFLINE);
+            followers.putIfAbsent(userId, new HashSet<>());
             System.out.println("✅ Onboarded user: " + username);
             return u;
         }
 
+        // NEW: subscribe watcher to target presence changes
+        void subscribePresence(User watcher, User target) {
+            followers.putIfAbsent(target.getUserId(), new HashSet<>());
+            followers.get(target.getUserId()).add(watcher.getUserId());
+            System.out.println("👀 " + watcher.getUsername() + " will be notified about " + target.getUsername() + " presence.");
+        }
+
         // presence
         void setPresence(User user, Presence p) {
+            Presence old = presence.getOrDefault(user.getUserId(), Presence.OFFLINE);
+            if (old == p) return; // avoid duplicate notifications
+
             presence.put(user.getUserId(), p);
             System.out.println("🟢 Presence: " + user.getUsername() + " -> " + p);
+
+            // notify followers
+            Set<String> watcherIds = followers.getOrDefault(user.getUserId(), Set.of());
+            for (String wid : watcherIds) {
+                User watcher = users.get(wid);
+                if (watcher == null) continue;
+                for (PresenceObserver obs : presenceObservers) {
+                    obs.onPresenceChanged(user, p, watcher);
+                }
+            }
         }
 
         boolean isOnline(User user) {
@@ -297,7 +337,6 @@ public class ChatServiceApp {
         }
 
         private void deliver(User receiver, Message msg) {
-            // simple rule: if offline, still queue in inbox (same receive)
             if (!isOnline(receiver)) {
                 System.out.println("📥 " + receiver.getUsername() + " is OFFLINE. Queuing message...");
             }
@@ -315,18 +354,29 @@ public class ChatServiceApp {
         User alice = chat.onboardUser("u2", "Alice");
         User bob   = chat.onboardUser("u3", "Bob");
 
+        // NEW: Subscribe to presence updates
+        chat.subscribePresence(john, bob);    // John wants notifications about Bob
+        chat.subscribePresence(alice, bob);   // Alice wants notifications about Bob
+        chat.subscribePresence(bob, john);    // Bob wants notifications about John
+
         chat.setPresence(john, Presence.ONLINE);
         chat.setPresence(alice, Presence.ONLINE);
         chat.setPresence(bob, Presence.OFFLINE);
 
+        System.out.println("\n--- Bob comes ONLINE ---");
+        chat.setPresence(bob, Presence.ONLINE);  // should notify John & Alice
+
         System.out.println("\n--- Direct message ---");
         chat.sendDirectText(john, alice, "Hello Alice!");
-        alice.readAll(); // triggers notification to John: Alice saw your message
+        alice.readAll();
 
         System.out.println("\n--- Group message ---");
         chat.createGroup("g1", "DevTeam", List.of(john, alice, bob));
         chat.sendGroupText(john, "g1", "Hi team!");
-        alice.readAll(); // notification to John: Alice saw...
-        bob.readAll();   // notification to John: Bob saw... (even if bob was offline, it was queued)
+        alice.readAll();
+        bob.readAll();
+
+        System.out.println("\n--- Bob goes OFFLINE ---");
+        chat.setPresence(bob, Presence.OFFLINE); // should notify John & Alice
     }
 }

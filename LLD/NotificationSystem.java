@@ -80,7 +80,7 @@ final class Push implements Notification {
 
 /* ======================= PROVIDERS ======================= */
 
-interface NotificationSender {
+interface NotificationProvider {
     String getProviderName();
     Set<Channel> supportedChannels();
 
@@ -91,13 +91,13 @@ interface NotificationSender {
     void send(Notification notification);
 }
 
-interface SchedulableNotificationSender extends NotificationSender {
+interface SchedulableNotificationProvider extends NotificationProvider {
     void schedule(Notification notification, LocalDateTime dateTime);
 }
 
 /* ======================= PROVIDER IMPLEMENTATIONS ======================= */
 
-class EmailProvider implements SchedulableNotificationSender {
+class EmailProvider implements SchedulableNotificationProvider {
 
     @Override public String getProviderName() { return "EmailProvider"; }
     @Override public Set<Channel> supportedChannels() { return Set.of(Channel.EMAIL); }
@@ -113,7 +113,7 @@ class EmailProvider implements SchedulableNotificationSender {
     }
 }
 
-class SMSProvider implements SchedulableNotificationSender {
+class SMSProvider implements SchedulableNotificationProvider {
 
     @Override public String getProviderName() { return "SMSProvider"; }
     @Override public Set<Channel> supportedChannels() { return Set.of(Channel.SMS); }
@@ -129,7 +129,7 @@ class SMSProvider implements SchedulableNotificationSender {
     }
 }
 
-class PushProvider implements SchedulableNotificationSender {
+class PushProvider implements SchedulableNotificationProvider {
 
     @Override public String getProviderName() { return "PushProvider"; }
     @Override public Set<Channel> supportedChannels() { return Set.of(Channel.PUSH); }
@@ -148,15 +148,15 @@ class PushProvider implements SchedulableNotificationSender {
 /* ======================= PROVIDER REGISTRY ======================= */
 
 class ProviderRegistry {
-    private final Map<Channel, List<NotificationSender>> providers = new HashMap<>();
+    private final Map<Channel, List<NotificationProvider>> providers = new HashMap<>();
 
-    public void register(NotificationSender sender) {
+    public void register(NotificationProvider sender) {
         for (Channel channel : sender.supportedChannels()) {
             providers.computeIfAbsent(channel, c -> new ArrayList<>()).add(sender);
         }
     }
 
-    public List<NotificationSender> getProviders(Channel channel) {
+    public List<NotificationProvider> getProviders(Channel channel) {
         return providers.getOrDefault(channel, List.of());
     }
 }
@@ -210,13 +210,13 @@ class NotificationDispatcher {
             return;
         }
 
-        List<NotificationSender> candidates = registry.getProviders(notification.getChannel());
+        List<NotificationProvider> candidates = registry.getProviders(notification.getChannel());
         if (candidates.isEmpty()) {
             System.out.println("No providers for channel " + notification.getChannel());
             return;
         }
 
-        NotificationSender provider =
+        NotificationProvider provider =
                 candidates.get(ThreadLocalRandom.current().nextInt(candidates.size()));
 
         provider.send(notification);
@@ -224,8 +224,8 @@ class NotificationDispatcher {
 
     public void schedule(User user, Notification notification, LocalDateTime time) {
         registry.getProviders(notification.getChannel()).stream()
-                .filter(p -> p instanceof SchedulableNotificationSender)
-                .map(p -> (SchedulableNotificationSender) p)
+                .filter(p -> p instanceof SchedulableNotificationProvider)
+                .map(p -> (SchedulableNotificationProvider) p)
                 .findAny()
                 .ifPresentOrElse(
                         p -> p.schedule(notification, time),

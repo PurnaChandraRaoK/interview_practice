@@ -118,27 +118,16 @@ namespace CabSharingApp
         }
     }
 
-    // Core system for cab sharing
-    public class CabSharingSystem
+    // Service for managing drivers
+    public class DriverService
     {
         private readonly Dictionary<Guid, Driver> drivers = new();
-        private readonly Dictionary<Guid, Rider> riders = new();
-        private readonly Dictionary<Guid, Ride> rides = new();
-        private readonly object matchLock = new();
 
-        // registration
         public Driver RegisterDriver(string name, Point initialLocation)
         {
             var d = new Driver(name, initialLocation);
             drivers[d.Id] = d;
             return d;
-        }
-
-        public Rider RegisterRider(string name)
-        {
-            var r = new Rider(name);
-            riders[r.Id] = r;
-            return r;
         }
 
         public bool UpdateDriverLocation(Guid driverId, Point newLocation)
@@ -148,7 +137,39 @@ namespace CabSharingApp
             return true;
         }
 
-        // Rider requests a ride. System finds nearest available driver and assigns.
+        public Driver? GetDriver(Guid id) => drivers.TryGetValue(id, out var d) ? d : null;
+
+        public IEnumerable<Driver> ListDrivers() => drivers.Values;
+
+        public IReadOnlyList<Ride> GetDriverHistory(Guid driverId)
+        {
+            if (!drivers.TryGetValue(driverId, out var d)) return Array.Empty<Ride>();
+            return d.RideHistory;
+        }
+
+        public List<Driver> GetAvailableDrivers() => drivers.Values.Where(d => d.IsAvailable).ToList();
+    }
+
+    // Service for managing rides and matching
+    public class RideService
+    {
+        private readonly Dictionary<Guid, Rider> riders = new();
+        private readonly Dictionary<Guid, Ride> rides = new();
+        private readonly DriverService driverService;
+        private readonly object matchLock = new();
+
+        public RideService(DriverService driverService)
+        {
+            this.driverService = driverService;
+        }
+
+        public Rider RegisterRider(string name)
+        {
+            var r = new Rider(name);
+            riders[r.Id] = r;
+            return r;
+        }
+
         public Ride RequestRide(Guid riderId, Point pickup, Point destination)
         {
             if (!riders.TryGetValue(riderId, out var rider))
@@ -157,43 +178,29 @@ namespace CabSharingApp
             var ride = new Ride(rider, pickup, destination);
             rides[ride.Id] = ride;
 
-            // Try to match with nearest available driver
             var assigned = TryAssignNearestDriver(ride);
-            if (!assigned)
-            {
-                // leave ride as Requested. Could implement retry/queueing.
-            }
-
             return ride;
         }
 
-        // Finds nearest available driver and assigns atomically
         private bool TryAssignNearestDriver(Ride ride)
         {
             lock (matchLock)
             {
-                var candidates = drivers.Values.Where(d => d.IsAvailable).ToList();
+                var candidates = driverService.GetAvailableDrivers();
                 if (!candidates.Any()) return false;
 
-                var nearest = candidates
-                    .OrderBy(d => d.Location.DistanceTo(ride.Pickup))
-                    .FirstOrDefault();
-
+                var nearest = candidates.OrderBy(d => d.Location.DistanceTo(ride.Pickup)).FirstOrDefault();
                 if (nearest == null) return false;
 
-                // Atomically mark driver unavailable
                 var taken = nearest.TrySetUnavailable();
                 if (!taken) return false;
 
                 ride.Driver = nearest;
                 ride.Status = RideStatus.Assigned;
-
-                // Add to temporary places, histories will be finalized at completion
                 return true;
             }
         }
 
-        // Driver starts the ride
         public bool StartRide(Guid rideId, Guid driverId)
         {
             if (!rides.TryGetValue(rideId, out var ride)) return false;
@@ -205,7 +212,6 @@ namespace CabSharingApp
             return true;
         }
 
-        // Complete ride: calculate fare, mark driver available, save history
         public bool CompleteRide(Guid rideId, Guid driverId)
         {
             if (!rides.TryGetValue(rideId, out var ride)) return false;
@@ -214,15 +220,10 @@ namespace CabSharingApp
 
             ride.Status = RideStatus.Completed;
             ride.CompletedAt = DateTime.UtcNow;
-
-            // Simple fare: base + per km
             ride.Fare = CalculateFare(ride.Distance);
 
-            // Update histories
             ride.Rider.rideHistory.Add(ride);
             ride.Driver!.rideHistory.Add(ride);
-
-            // Driver becomes available again
             ride.Driver.SetAvailable();
 
             return true;
@@ -230,8 +231,8 @@ namespace CabSharingApp
 
         private double CalculateFare(double distance)
         {
-            const double baseFare = 2.0; // base
-            const double perUnit = 1.5; // per distance unit
+            const double baseFare = 2.0;
+            const double perUnit = 1.5;
             return Math.Round(baseFare + distance * perUnit, 2);
         }
 
@@ -241,20 +242,24 @@ namespace CabSharingApp
             return r.RideHistory;
         }
 
-        public IReadOnlyList<Ride> GetDriverHistory(Guid driverId)
-        {
-            if (!drivers.TryGetValue(driverId, out var d)) return Array.Empty<Ride>();
-            return d.RideHistory;
-        }
-
-        public Driver? GetDriver(Guid id) => drivers.TryGetValue(id, out var d) ? d : null;
-        public Rider? GetRider(Guid id) => riders.TryGetValue(id, out var r) ? r : null;
         public Ride? GetRide(Guid id) => rides.TryGetValue(id, out var rv) ? rv : null;
 
-        // For demo / monitoring
-        public IEnumerable<Driver> ListDrivers() => drivers.Values;
         public IEnumerable<Rider> ListRiders() => riders.Values;
+
         public IEnumerable<Ride> ListRides() => rides.Values;
+    }
+
+    // Facade for demo
+    public class CabSharingSystem
+    {
+        public DriverService DriverService { get; }
+        public RideService RideService { get; }
+
+        public CabSharingSystem()
+        {
+            DriverService = new DriverService();
+            RideService = new RideService(DriverService);
+        }
     }
 
     class Program
@@ -262,24 +267,26 @@ namespace CabSharingApp
         static void Main()
         {
             var system = new CabSharingSystem();
+            var driverService = system.DriverService;
+            var rideService = system.RideService;
 
             // Register drivers
-            var d1 = system.RegisterDriver("Alice", new Point(0, 0));
-            var d2 = system.RegisterDriver("Bob", new Point(5, 5));
-            var d3 = system.RegisterDriver("Charlie", new Point(1, 2));
+            var d1 = driverService.RegisterDriver("Alice", new Point(0, 0));
+            var d2 = driverService.RegisterDriver("Bob", new Point(5, 5));
+            var d3 = driverService.RegisterDriver("Charlie", new Point(1, 2));
 
             // Register riders
-            var r1 = system.RegisterRider("RiderOne");
-            var r2 = system.RegisterRider("RiderTwo");
+            var r1 = rideService.RegisterRider("RiderOne");
+            var r2 = rideService.RegisterRider("RiderTwo");
 
             Console.WriteLine("Drivers:");
-            foreach (var d in system.ListDrivers())
+            foreach (var d in driverService.ListDrivers())
                 Console.WriteLine($" - {d.Name} at {d.Location} (available: {d.IsAvailable})");
 
             // RiderOne requests a ride
             var pickup = new Point(0.5, 0.5);
             var destination = new Point(10, 10);
-            var ride = system.RequestRide(r1.Id, pickup, destination);
+            var ride = rideService.RequestRide(r1.Id, pickup, destination);
 
             Console.WriteLine($"\nRide requested by {r1.Name}: {ride}");
 
@@ -288,13 +295,13 @@ namespace CabSharingApp
                 Console.WriteLine($"Assigned driver: {ride.Driver.Name} at {ride.Driver.Location}");
 
                 // Driver starts ride
-                var started = system.StartRide(ride.Id, ride.Driver.Id);
+                var started = rideService.StartRide(ride.Id, ride.Driver.Id);
                 Console.WriteLine($"Start ride: {started}");
 
                 // Simulate driver moving and completing ride
-                system.UpdateDriverLocation(ride.Driver.Id, destination);
+                driverService.UpdateDriverLocation(ride.Driver.Id, destination);
 
-                var completed = system.CompleteRide(ride.Id, ride.Driver.Id);
+                var completed = rideService.CompleteRide(ride.Id, ride.Driver.Id);
                 Console.WriteLine($"Complete ride: {completed}, Fare: {ride.Fare}");
             }
             else
@@ -303,27 +310,27 @@ namespace CabSharingApp
             }
 
             // RiderTwo requests a ride where nearest driver should be someone else
-            var ride2 = system.RequestRide(r2.Id, new Point(4.8, 4.9), new Point(6, 6));
+            var ride2 = rideService.RequestRide(r2.Id, new Point(4.8, 4.9), new Point(6, 6));
             Console.WriteLine($"\nRide requested by {r2.Name}: {ride2}");
             if (ride2.Driver != null)
             {
                 Console.WriteLine($"Assigned driver: {ride2.Driver.Name} at {ride2.Driver.Location}");
-                system.StartRide(ride2.Id, ride2.Driver.Id);
-                system.CompleteRide(ride2.Id, ride2.Driver.Id);
+                rideService.StartRide(ride2.Id, ride2.Driver.Id);
+                rideService.CompleteRide(ride2.Id, ride2.Driver.Id);
                 Console.WriteLine($"Ride completed. Fare: {ride2.Fare}");
             }
 
             // Print histories
             Console.WriteLine($"\n{r1.Name} ride history:");
-            foreach (var h in system.GetRiderHistory(r1.Id))
+            foreach (var h in rideService.GetRiderHistory(r1.Id))
                 Console.WriteLine($" - {h}");
 
             Console.WriteLine($"\n{d1.Name} ride history:");
-            foreach (var h in system.GetDriverHistory(d1.Id))
+            foreach (var h in driverService.GetDriverHistory(d1.Id))
                 Console.WriteLine($" - {h}");
 
             Console.WriteLine($"\n{d2.Name} ride history:");
-            foreach (var h in system.GetDriverHistory(d2.Id))
+            foreach (var h in driverService.GetDriverHistory(d2.Id))
                 Console.WriteLine($" - {h}");
 
             Console.WriteLine("\nDemo complete.");

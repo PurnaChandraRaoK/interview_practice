@@ -50,13 +50,8 @@ enum MatchType {
         this.maxOversPerBowler = maxOversPerBowler;
     }
 
-    public int getTotalOvers() {
-        return totalOvers;
-    }
-
-    public int getMaxOversPerBowler() {
-        return maxOversPerBowler;
-    }
+    public int getTotalOvers() { return totalOvers; }
+    public int getMaxOversPerBowler() { return maxOversPerBowler; }
 }
 
 // --- Observer Pattern Interfaces & Implementations ---
@@ -98,9 +93,12 @@ class BattingScorecardUpdater implements ScoreUpdaterObserver {
 
         batsman.getBattingScorecard().calculateStrikeRate();
 
+        // ✅ OUT / Not-out is innings specific => update innings state here
         if (ballDetails.isWicket()) {
-            batsman.setOut(true);
-            batsman.setOutDescription(ballDetails.getWicketDescription());
+            InningsDetails innings = ballDetails.getInnings();
+            if (innings != null) {
+                innings.markOut(batsman, ballDetails.getWicketDescription());
+            }
         }
 
         System.out.println(" [Batting Update] " + batsman.getName() + ": " + batsman.getBattingScorecard());
@@ -241,25 +239,16 @@ class Player extends Person {
     private final BattingScorecard battingScorecard;
     private final BowlingScorecard bowlingScorecard;
 
-    private boolean isOut;
-    private String outDescription;
-
     public Player(String name, int age, String address, PlayerType playerType) {
         super(name, age, address);
         this.playerType = Objects.requireNonNull(playerType);
         this.battingScorecard = new BattingScorecard();
         this.bowlingScorecard = new BowlingScorecard();
-        this.isOut = false;
-        this.outDescription = "";
     }
 
     public PlayerType getPlayerType() { return playerType; }
     public BattingScorecard getBattingScorecard() { return battingScorecard; }
     public BowlingScorecard getBowlingScorecard() { return bowlingScorecard; }
-    public boolean isOut() { return isOut; }
-    public void setOut(boolean out) { isOut = out; }
-    public String getOutDescription() { return outDescription; }
-    public void setOutDescription(String outDescription) { this.outDescription = outDescription; }
 
     @Override
     public String toString() {
@@ -277,9 +266,7 @@ class PlayerBattingController {
         this.yetToPlay = (yetToPlay == null) ? new LinkedList<>() : yetToPlay;
     }
 
-    public Player chooseNextBatsman() {
-        return yetToPlay.poll();
-    }
+    public Player chooseNextBatsman() { return yetToPlay.poll(); }
 
     public Player getStriker() { return striker; }
     public void setStriker(Player striker) { this.striker = striker; }
@@ -355,18 +342,13 @@ class Team {
     private final PlayerBattingController battingController = new PlayerBattingController();
     private final PlayerBowlingController bowlingController = new PlayerBowlingController();
 
-    public Team(String name) {
-        this.name = Objects.requireNonNull(name);
-    }
+    public Team(String name) { this.name = Objects.requireNonNull(name); }
 
     public String getName() { return name; }
 
     public void addPlayerToPlayingXI(Player player) {
-        if (playingXI.size() < 11) {
-            playingXI.add(player);
-        } else {
-            System.out.println("Playing XI is full. Add to bench.");
-        }
+        if (playingXI.size() < 11) playingXI.add(player);
+        else System.out.println("Playing XI is full. Add to bench.");
     }
 
     public void addPlayerToBench(Player player) { benchPlayers.add(player); }
@@ -408,6 +390,9 @@ class BallDetails {
     private final Player bowledBy;
     private final Player playedBy;
 
+    // ✅ Added: which innings this ball belongs to (so observers can update innings state)
+    private final InningsDetails innings;
+
     // Bat runs only (extras like +1 wide/no-ball are added elsewhere)
     private int runsScored;
 
@@ -416,10 +401,12 @@ class BallDetails {
 
     private final List<ScoreUpdaterObserver> observers = new ArrayList<>();
 
-    public BallDetails(int ballNumber, Player bowledBy, Player playedBy) {
+    public BallDetails(int ballNumber, Player bowledBy, Player playedBy, InningsDetails innings) {
         this.ballNumber = ballNumber;
         this.bowledBy = Objects.requireNonNull(bowledBy);
         this.playedBy = Objects.requireNonNull(playedBy);
+        this.innings = innings;
+
         this.ballType = BallType.NORMAL; // default safety
         this.runType = RunType.ZERO;     // default safety
         this.isWicket = false;
@@ -431,9 +418,7 @@ class BallDetails {
     public void removeObserver(ScoreUpdaterObserver observer) { observers.remove(observer); }
 
     public void notifyUpdaters() {
-        for (ScoreUpdaterObserver observer : observers) {
-            observer.update(this);
-        }
+        for (ScoreUpdaterObserver observer : observers) observer.update(this);
     }
 
     public void setBallType(BallType ballType) { this.ballType = ballType; }
@@ -444,9 +429,7 @@ class BallDetails {
     }
 
     /** For cases like NB/WD when you want explicit bat runs override (minimal fix for your main). */
-    public void setRunsScored(int runsScored) {
-        this.runsScored = Math.max(0, runsScored);
-    }
+    public void setRunsScored(int runsScored) { this.runsScored = Math.max(0, runsScored); }
 
     private int computeBatRunsFromRunType(RunType runType) {
         switch (runType) {
@@ -468,6 +451,7 @@ class BallDetails {
     public RunType getRunType() { return runType; }
     public Player getBowledBy() { return bowledBy; }
     public Player getPlayedBy() { return playedBy; }
+    public InningsDetails getInnings() { return innings; }
     public int getRunsScored() { return runsScored; }
     public boolean isWicket() { return isWicket; }
     public String getWicketDescription() { return wicketDescription; }
@@ -521,6 +505,29 @@ class InningsDetails {
     private int totalInningWickets;
     private int totalBallsBowled; // counts legal balls only
 
+    // ✅ Innings-specific batsman status
+    enum BatsmanInningsStatus { DID_NOT_BAT, PLAYING, OUT }
+
+    static class BatsmanInningsState {
+        private BatsmanInningsStatus status = BatsmanInningsStatus.DID_NOT_BAT;
+        private String outDescription = "";
+
+        public BatsmanInningsStatus getStatus() { return status; }
+        public String getOutDescription() { return outDescription; }
+
+        void setPlaying() {
+            status = BatsmanInningsStatus.PLAYING;
+            outDescription = "";
+        }
+
+        void setOut(String desc) {
+            status = BatsmanInningsStatus.OUT;
+            outDescription = (desc == null) ? "" : desc;
+        }
+    }
+
+    private final Map<Player, BatsmanInningsState> batsmanState = new HashMap<>();
+
     public InningsDetails(Team battingTeam, Team bowlingTeam) {
         this.battingTeam = Objects.requireNonNull(battingTeam);
         this.bowlingTeam = Objects.requireNonNull(bowlingTeam);
@@ -540,6 +547,22 @@ class InningsDetails {
                 totalBallsBowled++;
             }
         }
+    }
+
+    private BatsmanInningsState stateOf(Player p) {
+        return batsmanState.computeIfAbsent(p, k -> new BatsmanInningsState());
+    }
+
+    public void markPlaying(Player p) {
+        if (p != null) stateOf(p).setPlaying();
+    }
+
+    public void markOut(Player p, String desc) {
+        if (p != null) stateOf(p).setOut(desc);
+    }
+
+    public BatsmanInningsState getState(Player p) {
+        return batsmanState.getOrDefault(p, new BatsmanInningsState());
     }
 
     public Team getBattingTeam() { return battingTeam; }
@@ -618,7 +641,6 @@ class Match {
 
 /** Main class to simulate the Cricbuzz application. */
 public class Main {
-
     public static void main(String[] args) {
         System.out.println("--- Cricbuzz Low-Level Design Simulation ---");
 
@@ -673,12 +695,15 @@ public class Main {
         india.getBattingController().setStriker(currentStrikerIndia);
         india.getBattingController().setNonStriker(currentNonStrikerIndia);
 
+        // ✅ Mark openers as PLAYING (innings state)
+        inning1.markPlaying(currentStrikerIndia);
+        inning1.markPlaying(currentNonStrikerIndia);
+
         Player currentBowlerAustralia = australia.getBowlingController()
                 .chooseNextBowler(match.getMatchType().getMaxOversPerBowler());
         australia.getBowlingController().setCurrentBowler(currentBowlerAustralia);
 
         try (Scanner scanner = new Scanner(System.in)) {
-
             int oversToSimulate = 2;
 
             // live score (minimal fix so per-ball display is correct)
@@ -703,7 +728,7 @@ public class Main {
                     System.out.print("Enter runs (0-6, W for wicket, NB for no-ball, WD for wide): ");
                     String input = scanner.nextLine().trim().toUpperCase();
 
-                    BallDetails ball = new BallDetails(ballsInCurrentOver + 1, currentBowlerAustralia, currentStrikerIndia);
+                    BallDetails ball = new BallDetails(ballsInCurrentOver + 1, currentBowlerAustralia, currentStrikerIndia, inning1);
                     ball.registerObserver(battingUpdater);
                     ball.registerObserver(bowlingUpdater);
 
@@ -722,6 +747,9 @@ public class Main {
                             // next batsman
                             currentStrikerIndia = india.getBattingController().chooseNextBatsman();
                             india.getBattingController().setStriker(currentStrikerIndia);
+
+                            // ✅ Mark new batsman as PLAYING (if exists)
+                            inning1.markPlaying(currentStrikerIndia);
                             break;
 
                         case "NB":
@@ -822,9 +850,14 @@ public class Main {
             System.out.println("\n--- Final Scorecards (for India batsmen/Australia bowlers) ---");
             System.out.println("India Batting:");
             for (Player p : india.getPlayingXI()) {
-                if (p.getBattingScorecard().getTotalBallsPlayed() > 0 || p.isOut()) {
+                InningsDetails.BatsmanInningsState st = inning1.getState(p);
+
+                boolean batted = p.getBattingScorecard().getTotalBallsPlayed() > 0;
+                if (st.getStatus() == InningsDetails.BatsmanInningsStatus.OUT) {
                     System.out.println(" " + p.getName() + ": " + p.getBattingScorecard()
-                            + (p.isOut() ? " (" + p.getOutDescription() + ")" : " (Not Out)"));
+                            + " (" + st.getOutDescription() + ")");
+                } else if (batted || st.getStatus() == InningsDetails.BatsmanInningsStatus.PLAYING) {
+                    System.out.println(" " + p.getName() + ": " + p.getBattingScorecard() + " (Not Out)");
                 } else {
                     System.out.println(" " + p.getName() + ": " + p.getBattingScorecard() + " (Did Not Bat)");
                 }

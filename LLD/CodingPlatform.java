@@ -1,13 +1,10 @@
-import java.util.*;
-import java.util.concurrent.ConcurrentHashMap;
-import java.util.concurrent.ConcurrentLinkedQueue;
-import java.util.stream.Collectors;
-
-import static java.util.Objects.requireNonNull;
-
 /**
  * Online Coding Platform - LLD oriented
  * Focus: Flow, Structure, SOLID, Patterns, Readability, Extensibility
+ *
+ * Extension added (without changing major logic):
+ * - Contests: create contest, add problems to contest, users join contest
+ * - Problem search: by type, name, difficulty
  */
 public class OnlineCodingPlatform {
 
@@ -19,7 +16,6 @@ public class OnlineCodingPlatform {
         private String email;
         private UserRole role;
 
-        // Safer default initialization
         private final List<Submission> submissions = new ArrayList<>();
         private int totalScore;
 
@@ -51,11 +47,18 @@ public class OnlineCodingPlatform {
 
     // -------------------- Problem Domain --------------------
 
+    public enum ProblemType {
+        ALGORITHMS, DATABASE, SYSTEM_DESIGN, OOPS, OTHER
+    }
+
     public static class Problem {
         private String problemId;
         private String title;
         private String description;
         private Difficulty difficulty;
+
+        // Added: problem type (small extension)
+        private ProblemType type = ProblemType.OTHER;
 
         private final List<String> tags = new ArrayList<>();
         private final List<TestCase> testCases = new ArrayList<>();
@@ -69,6 +72,7 @@ public class OnlineCodingPlatform {
         public String getTitle() { return title; }
         public String getDescription() { return description; }
         public Difficulty getDifficulty() { return difficulty; }
+        public ProblemType getType() { return type; }
         public List<String> getTags() { return tags; }
         public List<TestCase> getTestCases() { return testCases; }
         public String getFunctionSignature() { return functionSignature; }
@@ -79,6 +83,7 @@ public class OnlineCodingPlatform {
         public void setTitle(String title) { this.title = title; }
         public void setDescription(String description) { this.description = description; }
         public void setDifficulty(Difficulty difficulty) { this.difficulty = difficulty; }
+        public void setType(ProblemType type) { this.type = (type == null) ? ProblemType.OTHER : type; }
         public void setFunctionSignature(String functionSignature) { this.functionSignature = functionSignature; }
         public void setAcceptanceRate(int acceptanceRate) { this.acceptanceRate = acceptanceRate; }
         public void setTotalSubmissions(int totalSubmissions) { this.totalSubmissions = totalSubmissions; }
@@ -121,7 +126,6 @@ public class OnlineCodingPlatform {
 
         public ProblemBuilder() {
             this.problem = new Problem();
-            // Provide a default id for demo usage
             this.problem.setProblemId(UUID.randomUUID().toString());
         }
 
@@ -137,6 +141,11 @@ public class OnlineCodingPlatform {
 
         public ProblemBuilder setDifficulty(Difficulty difficulty) {
             problem.setDifficulty(difficulty);
+            return this;
+        }
+
+        public ProblemBuilder setType(ProblemType type) {
+            problem.setType(type);
             return this;
         }
 
@@ -165,11 +174,11 @@ public class OnlineCodingPlatform {
     public static class AlgorithmProblemFactory implements ProblemFactory {
         @Override
         public Problem createProblem(String title, String description, Difficulty difficulty) {
-            // Using Builder under the hood for consistency
             return new ProblemBuilder()
                     .setTitle(title)
                     .setDescription(description)
                     .setDifficulty(difficulty)
+                    .setType(ProblemType.ALGORITHMS)
                     .build();
         }
     }
@@ -181,7 +190,50 @@ public class OnlineCodingPlatform {
                     .setTitle(title)
                     .setDescription(description)
                     .setDifficulty(difficulty)
+                    .setType(ProblemType.DATABASE)
                     .build();
+        }
+    }
+
+    // -------------------- Contest Domain --------------------
+
+    public enum ContestStatus { DRAFT, OPEN, ENDED }
+
+    public static class Contest {
+        private String contestId;
+        private String name;
+        private ContestStatus status = ContestStatus.DRAFT;
+
+        // Simple time fields for extensibility (optional usage)
+        private long startTimeEpochMs;
+        private long endTimeEpochMs;
+
+        // Contest has problems (store ids to keep repositories decoupled)
+        private final List<String> problemIds = new ArrayList<>();
+
+        // Users join contest
+        private final Set<String> participantUserIds = new HashSet<>();
+
+        public String getContestId() { return contestId; }
+        public String getName() { return name; }
+        public ContestStatus getStatus() { return status; }
+        public long getStartTimeEpochMs() { return startTimeEpochMs; }
+        public long getEndTimeEpochMs() { return endTimeEpochMs; }
+        public List<String> getProblemIds() { return problemIds; }
+        public Set<String> getParticipantUserIds() { return participantUserIds; }
+
+        public void setContestId(String contestId) { this.contestId = contestId; }
+        public void setName(String name) { this.name = name; }
+        public void setStatus(ContestStatus status) { this.status = (status == null) ? ContestStatus.DRAFT : status; }
+        public void setStartTimeEpochMs(long startTimeEpochMs) { this.startTimeEpochMs = startTimeEpochMs; }
+        public void setEndTimeEpochMs(long endTimeEpochMs) { this.endTimeEpochMs = endTimeEpochMs; }
+
+        public void addProblem(String problemId) {
+            if (problemId != null && !problemIds.contains(problemId)) problemIds.add(problemId);
+        }
+
+        public void addParticipant(String userId) {
+            if (userId != null) participantUserIds.add(userId);
         }
     }
 
@@ -191,6 +243,9 @@ public class OnlineCodingPlatform {
         private String submissionId;
         private String userId;
         private String problemId;
+
+        // Optional: if submission belongs to a contest (kept optional to avoid major changes)
+        private String contestId;
 
         private String code;
         private Language language;
@@ -205,6 +260,7 @@ public class OnlineCodingPlatform {
         public String getSubmissionId() { return submissionId; }
         public String getUserId() { return userId; }
         public String getProblemId() { return problemId; }
+        public String getContestId() { return contestId; }
         public String getCode() { return code; }
         public Language getLanguage() { return language; }
         public SubmissionStatus getStatus() { return status; }
@@ -216,6 +272,7 @@ public class OnlineCodingPlatform {
         public void setSubmissionId(String submissionId) { this.submissionId = submissionId; }
         public void setUserId(String userId) { this.userId = userId; }
         public void setProblemId(String problemId) { this.problemId = problemId; }
+        public void setContestId(String contestId) { this.contestId = contestId; }
         public void setCode(String code) { this.code = code; }
         public void setLanguage(Language language) { this.language = language; }
         public void setStatus(SubmissionStatus status) { this.status = status; }
@@ -246,7 +303,7 @@ public class OnlineCodingPlatform {
         TIME_LIMIT_EXCEEDED,
         COMPILATION_ERROR,
         RUNTIME_ERROR,
-        FAILED // small addition for robustness (not a major logic change)
+        FAILED
     }
 
     public static class TestCaseResult {
@@ -278,7 +335,6 @@ public class OnlineCodingPlatform {
     public static class LocalExecutionStrategy implements CodeExecutionStrategy {
         @Override
         public ExecutionResult execute(String code, Language language, List<TestCase> testCases) {
-            // Placeholder - real impl would sandbox locally
             ExecutionResult result = new ExecutionResult();
             result.setStatus(SubmissionStatus.ACCEPTED);
             result.setTotalExecutionTime(12);
@@ -460,7 +516,6 @@ public class OnlineCodingPlatform {
         }
 
         private void loadConfiguration() {
-            // Load configuration from file or environment (placeholder)
             config.setProperty(KEY_MAX_EXECUTION_TIME, "5000");
             config.setProperty(KEY_MAX_MEMORY_LIMIT, "128MB");
         }
@@ -511,6 +566,21 @@ public class OnlineCodingPlatform {
                     .filter(p -> p.getDifficulty() == difficulty)
                     .collect(Collectors.toList());
         }
+
+        public List<Problem> findByType(ProblemType type) {
+            return problems.values()
+                    .stream()
+                    .filter(p -> p.getType() == type)
+                    .collect(Collectors.toList());
+        }
+
+        public List<Problem> findByTitleContains(String query) {
+            String q = (query == null) ? "" : query.trim().toLowerCase();
+            return problems.values()
+                    .stream()
+                    .filter(p -> p.getTitle() != null && p.getTitle().toLowerCase().contains(q))
+                    .collect(Collectors.toList());
+        }
     }
 
     public static class SubmissionRepository implements Repository<Submission> {
@@ -547,6 +617,34 @@ public class OnlineCodingPlatform {
         }
     }
 
+    // NEW: ContestRepository
+    public static class ContestRepository implements Repository<Contest> {
+        private final Map<String, Contest> contests = new ConcurrentHashMap<>();
+
+        @Override
+        public Contest save(Contest contest) {
+            requireNonNull(contest);
+            requireNonNull(contest.getContestId());
+            contests.put(contest.getContestId(), contest);
+            return contest;
+        }
+
+        @Override
+        public Contest findById(String id) {
+            return contests.get(id);
+        }
+
+        @Override
+        public List<Contest> findAll() {
+            return new ArrayList<>(contests.values());
+        }
+
+        @Override
+        public void delete(String id) {
+            contests.remove(id);
+        }
+    }
+
     // -------------------- Service Layer --------------------
 
     public static class SubmissionService implements Subject {
@@ -567,7 +665,6 @@ public class OnlineCodingPlatform {
         public void processSubmission(Submission submission) {
             requireNonNull(submission);
 
-            // Minimal correctness: ensure id exists
             if (submission.getSubmissionId() == null) {
                 submission.setSubmissionId(UUID.randomUUID().toString());
             }
@@ -631,6 +728,7 @@ public class OnlineCodingPlatform {
             this.problemRepository = requireNonNull(problemRepository);
         }
 
+        // Kept existing signature
         public Problem createProblem(String title, String description, Difficulty difficulty) {
             Problem problem = new ProblemBuilder()
                     .setTitle(title)
@@ -641,8 +739,115 @@ public class OnlineCodingPlatform {
             return problemRepository.save(problem);
         }
 
+        // Overload for type (small extension)
+        public Problem createProblem(String title, String description, Difficulty difficulty, ProblemType type) {
+            Problem problem = new ProblemBuilder()
+                    .setTitle(title)
+                    .setDescription(description)
+                    .setDifficulty(difficulty)
+                    .setType(type)
+                    .build();
+
+            return problemRepository.save(problem);
+        }
+
         public List<Problem> getProblemsByDifficulty(Difficulty difficulty) {
             return problemRepository.findByDifficulty(difficulty);
+        }
+
+        // NEW: search by type, name, difficulty (simple filter pipeline)
+        public List<Problem> searchProblems(ProblemSearchCriteria criteria) {
+            requireNonNull(criteria);
+
+            return problemRepository.findAll()
+                    .stream()
+                    .filter(p -> criteria.getDifficulty() == null || p.getDifficulty() == criteria.getDifficulty())
+                    .filter(p -> criteria.getType() == null || p.getType() == criteria.getType())
+                    .filter(p -> {
+                        if (criteria.getNameQuery() == null || criteria.getNameQuery().trim().isEmpty()) return true;
+                        String q = criteria.getNameQuery().trim().toLowerCase();
+                        return p.getTitle() != null && p.getTitle().toLowerCase().contains(q);
+                    })
+                    .collect(Collectors.toList());
+        }
+    }
+
+    public interface ProblemSearch {
+        List<Problem> search(ProblemSearchCriteria c);
+    }
+
+    public static class ProblemSearchCriteria {
+        private final String nameQuery;
+        private final ProblemType type;
+        private final Difficulty difficulty;
+
+        // builder
+    }
+
+    // NEW: ContestService (create contest, add problems, user joins, list contest problems)
+    public static class ContestService {
+        private final ContestRepository contestRepository;
+        private final ProblemRepository problemRepository;
+
+        public ContestService(ContestRepository contestRepository, ProblemRepository problemRepository) {
+            this.contestRepository = requireNonNull(contestRepository);
+            this.problemRepository = requireNonNull(problemRepository);
+        }
+
+        public Contest createContest(String name, List<String> problemIds) {
+            Contest contest = new Contest();
+            contest.setContestId(UUID.randomUUID().toString());
+            contest.setName(name);
+            contest.setStatus(ContestStatus.DRAFT);
+
+            if (problemIds != null) {
+                for (String pid : problemIds) {
+                    // keep it light: only add if problem exists
+                    if (pid != null && problemRepository.findById(pid) != null) contest.addProblem(pid);
+                }
+            }
+            return contestRepository.save(contest);
+        }
+
+        public Contest openContest(String contestId) {
+            Contest contest = contestRepository.findById(contestId);
+            if (contest == null) return null;
+            contest.setStatus(ContestStatus.OPEN);
+            return contestRepository.save(contest);
+        }
+
+        public boolean addProblemToContest(String contestId, String problemId) {
+            Contest contest = contestRepository.findById(contestId);
+            if (contest == null) return false;
+            if (problemRepository.findById(problemId) == null) return false;
+            contest.addProblem(problemId);
+            contestRepository.save(contest);
+            return true;
+        }
+
+        public boolean joinContest(String contestId, String userId) {
+            Contest contest = contestRepository.findById(contestId);
+            if (contest == null) return false;
+            if (contest.getStatus() != ContestStatus.OPEN) return false;
+            contest.addParticipant(userId);
+            contestRepository.save(contest);
+            return true;
+        }
+
+        public List<Problem> getContestProblems(String contestId) {
+            Contest contest = contestRepository.findById(contestId);
+            if (contest == null) return Collections.emptyList();
+
+            List<Problem> result = new ArrayList<>();
+            for (String pid : contest.getProblemIds()) {
+                Problem p = problemRepository.findById(pid);
+                if (p != null) result.add(p);
+            }
+            return result;
+        }
+
+        public List<Contest> listAllContests() {
+            return contestRepository.findAll();
         }
     }
 
@@ -653,6 +858,7 @@ public class OnlineCodingPlatform {
         // Initialize repositories
         ProblemRepository problemRepo = new ProblemRepository();
         SubmissionRepository submissionRepo = new SubmissionRepository();
+        ContestRepository contestRepo = new ContestRepository();
 
         // Initialize execution strategy + executor
         CodeExecutionStrategy strategy = new DockerExecutionStrategy();
@@ -661,26 +867,52 @@ public class OnlineCodingPlatform {
         // Initialize services
         SubmissionService submissionService = new SubmissionService(submissionRepo, problemRepo, executor);
         ProblemService problemService = new ProblemService(problemRepo);
+        ContestService contestService = new ContestService(contestRepo, problemRepo);
 
         // Add observers
         submissionService.addObserver(new LeaderboardObserver());
         submissionService.addObserver(new NotificationObserver());
 
-        // Create a sample problem
-        Problem problem = problemService.createProblem(
+        // Create sample problems
+        Problem twoSum = problemService.createProblem(
                 "Two Sum",
                 "Find two numbers that add up to target",
-                Difficulty.EASY
+                Difficulty.EASY,
+                ProblemType.ALGORITHMS
+        );
+        twoSum.getTestCases().add(new TestCase("nums=[2,7,11,15], target=9", "[0,1]", false));
+        problemRepo.save(twoSum);
+
+        Problem sqlJoin = problemService.createProblem(
+                "Top Customers",
+                "Find top customers by total spend",
+                Difficulty.MEDIUM,
+                ProblemType.DATABASE
+        );
+        problemRepo.save(sqlJoin);
+
+        // Create contest with problems
+        Contest contest = contestService.createContest("Weekly Contest #1", Arrays.asList(twoSum.getProblemId(), sqlJoin.getProblemId()));
+        contestService.openContest(contest.getContestId());
+
+        // User joins contest
+        boolean joined = contestService.joinContest(contest.getContestId(), "user123");
+        // (joined is just for demo)
+
+        // Search problems by type/name/difficulty
+        List<Problem> searchResults = problemService.searchProblems(
+                new ProblemSearchCriteria.Builder()
+                        .type(ProblemType.ALGORITHMS)
+                        .difficulty(Difficulty.EASY)
+                        .nameQuery("sum")
+                        .build()
         );
 
-        // Add some test cases (minimal demo)
-        problem.getTestCases().add(new TestCase("nums=[2,7,11,15], target=9", "[0,1]", false));
-        problemRepo.save(problem);
-
-        // Create a submission
+        // Create a submission (optionally link to contest)
         Submission submission = new Submission();
         submission.setUserId("user123");
-        submission.setProblemId(problem.getProblemId());
+        submission.setProblemId(twoSum.getProblemId());
+        submission.setContestId(contest.getContestId());
         submission.setCode("public int[] twoSum(int[] nums, int target) { ... }");
         submission.setLanguage(Language.JAVA);
 
@@ -690,5 +922,10 @@ public class OnlineCodingPlatform {
 
         invoker.addCommand(submissionCommand);
         invoker.processCommands();
+
+        // (Optional demo prints)
+        System.out.println("Joined contest? " + joined);
+        System.out.println("Contest problems: " + contestService.getContestProblems(contest.getContestId()).stream().map(Problem::getTitle).collect(Collectors.toList()));
+        System.out.println("Search results: " + searchResults.stream().map(Problem::getTitle).collect(Collectors.toList()));
     }
 }

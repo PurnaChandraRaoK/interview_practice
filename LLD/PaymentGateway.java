@@ -1,33 +1,30 @@
+import java.util.*;
+import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.atomic.AtomicInteger;
+
 // ─────────────────────────────────────────────────────────────────────────────
 // Enums
 // ─────────────────────────────────────────────────────────────────────────────
 enum PaymentMethod { CREDIT_CARD, DEBIT_CARD, UPI, NET_BANKING, WALLET }
-
 enum PaymentStatus { CREATED, PROCESSING, SUCCESS, FAILED }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// Client
+// Client + Gateway
 // ─────────────────────────────────────────────────────────────────────────────
 final class Client {
     private final String name;
     private final Set<PaymentMethod> supportedMethods = EnumSet.noneOf(PaymentMethod.class);
 
     Client(String name) { this.name = Objects.requireNonNull(name, "name"); }
-
     String getName() { return name; }
 
     boolean supports(PaymentMethod m) { return supportedMethods.contains(m); }
-
     void addMethod(PaymentMethod m) { supportedMethods.add(Objects.requireNonNull(m, "method")); }
-
     void removeMethod(PaymentMethod m) { supportedMethods.remove(m); }
 
     Set<PaymentMethod> getMethods() { return Collections.unmodifiableSet(supportedMethods); }
 }
 
-// ─────────────────────────────────────────────────────────────────────────────
-// PaymentGateway (ONLY holds clients + their supported methods)  (same as your code)
-// ─────────────────────────────────────────────────────────────────────────────
 final class PaymentGateway {
     private final Map<String, Client> clients = new ConcurrentHashMap<>();
 
@@ -37,27 +34,20 @@ final class PaymentGateway {
         if (prev != null) throw new IllegalArgumentException("Client exists: " + c.getName());
     }
 
-    void removeClient(String name) { clients.remove(name); }
-
     Client getClient(String name) {
         Client c = clients.get(name);
         if (c == null) throw new NoSuchElementException("Client not found: " + name);
         return c;
     }
 
-    List<PaymentMethod> listSupportedMethods(String clientName) {
-        return new ArrayList<>(getClient(clientName).getMethods());
-    }
-
     void addSupport(String clientName, PaymentMethod m) { getClient(clientName).addMethod(m); }
-
     void removeSupport(String clientName, PaymentMethod m) { getClient(clientName).removeMethod(m); }
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// Payment Details (typed request payload per method)
+// PaymentDetails (Java 8 simplified)
 // ─────────────────────────────────────────────────────────────────────────────
-sealed interface PaymentDetails permits CardDetails, UpiDetails, NetBankingDetails, WalletDetails {}
+interface PaymentDetails { }
 
 final class CardDetails implements PaymentDetails {
     final String number, cvv, expiry, holder;
@@ -96,7 +86,7 @@ final class PaymentRequest {
     final PaymentDetails details;
     final double amount;
     final String currency;
-    final String idempotencyKey; // REQUIRED for "no double charge" guarantee
+    final String idempotencyKey; // same request should not charge twice
 
     PaymentRequest(String client, PaymentMethod method, PaymentDetails details,
                    double amount, String currency, String idempotencyKey) {
@@ -105,7 +95,7 @@ final class PaymentRequest {
         this.details = Objects.requireNonNull(details, "details");
         if (amount <= 0) throw new IllegalArgumentException("amount must be > 0");
         this.amount = amount;
-        this.currency = (currency == null || currency.isBlank()) ? "INR" : currency;
+        this.currency = (currency == null || currency.trim().isEmpty()) ? "INR" : currency;
         this.idempotencyKey = Objects.requireNonNull(idempotencyKey, "idempotencyKey");
     }
 }
@@ -125,7 +115,43 @@ final class PaymentResponse {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// Payment (Transaction) + Repository
+// Attempt (replacement for List<String> attempts)
+// ─────────────────────────────────────────────────────────────────────────────
+enum AttemptOutcome { TRY, SUCCESS, FAIL }
+
+final class Attempt {
+    final int number;
+    final String provider;
+    final AttemptOutcome outcome;
+    final String reason; // null unless FAIL
+
+    Attempt(int number, String provider, AttemptOutcome outcome, String reason) {
+        this.number = number;
+        this.provider = Objects.requireNonNull(provider, "provider");
+        this.outcome = Objects.requireNonNull(outcome, "outcome");
+        this.reason = reason;
+    }
+
+    static Attempt tryAttempt(int number, String provider) {
+        return new Attempt(number, provider, AttemptOutcome.TRY, null);
+    }
+
+    static Attempt successAttempt(int number, String provider) {
+        return new Attempt(number, provider, AttemptOutcome.SUCCESS, null);
+    }
+
+    static Attempt failAttempt(int number, String provider, String reason) {
+        return new Attempt(number, provider, AttemptOutcome.FAIL, reason);
+    }
+
+    @Override public String toString() {
+        if (outcome == AttemptOutcome.FAIL) return "#" + number + " " + provider + " FAIL (" + reason + ")";
+        return "#" + number + " " + provider + " " + outcome;
+    }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Payment + Repository (idempotency)
 // ─────────────────────────────────────────────────────────────────────────────
 final class Payment {
     private final String id;
@@ -140,7 +166,8 @@ final class Payment {
     private volatile String providerRef;
     private volatile String failureReason;
 
-    private final List<String> attempts = new ArrayList<>();
+    // ✅ Typed attempts
+    private final List<Attempt> attempts = new ArrayList<>();
 
     Payment(String client, PaymentMethod method, double amount, String currency, String idempotencyKey) {
         this.id = UUID.randomUUID().toString();
@@ -172,7 +199,9 @@ final class Payment {
         this.failureReason = reason;
     }
 
-    synchronized void addAttempt(String s) { attempts.add(s); }
+    synchronized void addAttempt(Attempt a) { attempts.add(a); }
+
+    synchronized List<Attempt> getAttempts() { return new ArrayList<>(attempts); }
 
     @Override public String toString() {
         return "Payment[id=" + id +
@@ -199,12 +228,10 @@ final class PaymentRepository {
     }
 
     Payment findByIdempotency(String client, String idemKey) {
-        String k = composite(client, idemKey);
-        String id = idempotencyIndex.get(k);
-        return (id == null) ? null : byId.get(id);
+        String id = idempotencyIndex.get(composite(client, idemKey));
+        return id == null ? null : byId.get(id);
     }
 
-    // Ensures idempotency: same client+key returns same Payment object
     Payment createIfAbsent(String client, PaymentMethod method, double amount, String currency, String idemKey) {
         String k = composite(client, idemKey);
 
@@ -226,158 +253,17 @@ final class PaymentRepository {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// Provider abstraction + failures
+// Method validators (Strategy Pattern)
 // ─────────────────────────────────────────────────────────────────────────────
-final class ProviderException extends RuntimeException {
-    ProviderException(String msg) { super(msg); }
-}
-
-final class ProviderChargeResult {
-    final String providerRef;
-    ProviderChargeResult(String providerRef) { this.providerRef = providerRef; }
-}
-
-interface PaymentProvider {
-    String name();
-    boolean supports(PaymentMethod method);
-    ProviderChargeResult charge(Payment payment, PaymentRequest request);
-}
-
-// Mock Providers (simulate success/failure)
-final class StripeProvider implements PaymentProvider {
-    private final Random rnd;
-    StripeProvider(Random rnd) { this.rnd = Objects.requireNonNull(rnd); }
-
-    public String name() { return "Stripe"; }
-
-    public boolean supports(PaymentMethod method) {
-        return method == PaymentMethod.CREDIT_CARD || method == PaymentMethod.DEBIT_CARD ||
-               method == PaymentMethod.UPI || method == PaymentMethod.WALLET;
-    }
-
-    public ProviderChargeResult charge(Payment payment, PaymentRequest request) {
-        // Simulate occasional provider failure
-        if (rnd.nextInt(100) < 20) throw new ProviderException("Stripe provider error");
-        System.out.println("Stripe charged: " + request.amount + " " + request.currency + " via " + request.method);
-        return new ProviderChargeResult("st_" + UUID.randomUUID().toString().substring(0, 8));
-    }
-}
-
-final class RazorpayProvider implements PaymentProvider {
-    private final Random rnd;
-    RazorpayProvider(Random rnd) { this.rnd = Objects.requireNonNull(rnd); }
-
-    public String name() { return "Razorpay"; }
-
-    public boolean supports(PaymentMethod method) {
-        return method == PaymentMethod.UPI || method == PaymentMethod.NET_BANKING ||
-               method == PaymentMethod.CREDIT_CARD || method == PaymentMethod.DEBIT_CARD;
-    }
-
-    public ProviderChargeResult charge(Payment payment, PaymentRequest request) {
-        if (rnd.nextInt(100) < 25) throw new ProviderException("Razorpay provider timeout");
-        System.out.println("Razorpay charged: " + request.amount + " " + request.currency + " via " + request.method);
-        return new ProviderChargeResult("rzp_" + UUID.randomUUID().toString().substring(0, 8));
-    }
-}
-
-final class PaypalProvider implements PaymentProvider {
-    private final Random rnd;
-    PaypalProvider(Random rnd) { this.rnd = Objects.requireNonNull(rnd); }
-
-    public String name() { return "PayPal"; }
-
-    public boolean supports(PaymentMethod method) {
-        return method == PaymentMethod.WALLET || method == PaymentMethod.CREDIT_CARD || method == PaymentMethod.DEBIT_CARD;
-    }
-
-    public ProviderChargeResult charge(Payment payment, PaymentRequest request) {
-        if (rnd.nextInt(100) < 30) throw new ProviderException("PayPal rejected transaction");
-        System.out.println("PayPal charged: " + request.amount + " " + request.currency + " via " + request.method);
-        return new ProviderChargeResult("pp_" + UUID.randomUUID().toString().substring(0, 8));
-    }
-}
-
-// ─────────────────────────────────────────────────────────────────────────────
-// Provider Registry + Router (route + failover)
-// ─────────────────────────────────────────────────────────────────────────────
-final class ProviderRegistry {
-    private final List<PaymentProvider> providers = new ArrayList<>();
-
-    void register(PaymentProvider p) { providers.add(Objects.requireNonNull(p)); }
-
-    List<PaymentProvider> all() { return Collections.unmodifiableList(providers); }
-}
-
-// simple circuit breaker-ish health tracking (kept interview-simple)
-final class ProviderHealth {
-    private final Map<String, Integer> consecutiveFailures = new ConcurrentHashMap<>();
-    private final int failureThreshold;
-
-    ProviderHealth(int failureThreshold) { this.failureThreshold = Math.max(1, failureThreshold); }
-
-    boolean isHealthy(String provider) {
-        return consecutiveFailures.getOrDefault(provider, 0) < failureThreshold;
-    }
-
-    void recordSuccess(String provider) { consecutiveFailures.put(provider, 0); }
-
-    void recordFailure(String provider) {
-        consecutiveFailures.merge(provider, 1, Integer::sum);
-    }
-}
-
-interface ProviderRouter {
-    List<PaymentProvider> routeCandidates(PaymentMethod method);
-}
-
-// round-robin per method + skip unhealthy providers
-final class RoundRobinRouter implements ProviderRouter {
-    private final ProviderRegistry registry;
-    private final ProviderHealth health;
-    private final Map<PaymentMethod, AtomicInteger> rr = new EnumMap<>(PaymentMethod.class);
-
-    RoundRobinRouter(ProviderRegistry registry, ProviderHealth health) {
-        this.registry = Objects.requireNonNull(registry);
-        this.health = Objects.requireNonNull(health);
-        for (PaymentMethod m : PaymentMethod.values()) rr.put(m, new AtomicInteger(0));
-    }
-
-    @Override
-    public List<PaymentProvider> routeCandidates(PaymentMethod method) {
-        List<PaymentProvider> supported = new ArrayList<>();
-        for (PaymentProvider p : registry.all()) {
-            if (p.supports(method) && health.isHealthy(p.name())) supported.add(p);
-        }
-        if (supported.isEmpty()) {
-            // If all unhealthy, allow fallback to any provider that supports method
-            for (PaymentProvider p : registry.all()) if (p.supports(method)) supported.add(p);
-        }
-        if (supported.isEmpty()) return List.of();
-
-        // rotate list based on RR pointer
-        int start = Math.floorMod(rr.get(method).getAndIncrement(), supported.size());
-        List<PaymentProvider> ordered = new ArrayList<>(supported.size());
-        ordered.addAll(supported.subList(start, supported.size()));
-        ordered.addAll(supported.subList(0, start));
-        return ordered;
-    }
-}
-
-// ─────────────────────────────────────────────────────────────────────────────
-// Payment method validation (Strategy Pattern stays, just expanded)
-// ─────────────────────────────────────────────────────────────────────────────
-interface PaymentService {
-    void validate(PaymentRequest req);
-}
+interface PaymentService { void validate(PaymentRequest req); }
 
 final class CardPaymentService implements PaymentService {
-    private final PaymentMethod cardType;
-    CardPaymentService(PaymentMethod cardType) { this.cardType = cardType; }
+    private final PaymentMethod type;
+    CardPaymentService(PaymentMethod type) { this.type = type; }
 
     public void validate(PaymentRequest req) {
-        if (req.method != cardType) throw new IllegalArgumentException("Wrong service for " + req.method);
-        if (!(req.details instanceof CardDetails)) throw new IllegalArgumentException(cardType + " expects CardDetails");
+        if (req.method != type) throw new IllegalArgumentException("Wrong service for " + req.method);
+        if (!(req.details instanceof CardDetails)) throw new IllegalArgumentException(type + " expects CardDetails");
     }
 }
 
@@ -403,102 +289,252 @@ final class WalletPaymentService implements PaymentService {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// Core Orchestrator (TransactionService -> now routes to providers + idempotency)
+// Providers
+// ─────────────────────────────────────────────────────────────────────────────
+final class ProviderException extends RuntimeException {
+    ProviderException(String msg) { super(msg); }
+}
+
+final class ProviderChargeResult {
+    final String providerRef;
+    ProviderChargeResult(String providerRef) { this.providerRef = providerRef; }
+}
+
+interface PaymentProvider {
+    String name();
+    Set<PaymentMethod> supportedMethods();
+    ProviderChargeResult charge(Payment payment, PaymentRequest request);
+}
+
+final class StripeProvider implements PaymentProvider {
+    private final Random rnd;
+    StripeProvider(Random rnd) { this.rnd = Objects.requireNonNull(rnd); }
+
+    public String name() { return "Stripe"; }
+
+    public Set<PaymentMethod> supportedMethods() {
+        return EnumSet.of(PaymentMethod.CREDIT_CARD, PaymentMethod.DEBIT_CARD, PaymentMethod.UPI, PaymentMethod.WALLET);
+    }
+
+    public ProviderChargeResult charge(Payment payment, PaymentRequest request) {
+        if (rnd.nextInt(100) < 20) throw new ProviderException("Stripe provider error");
+        System.out.println("Stripe charged: " + request.amount + " " + request.currency + " via " + request.method);
+        return new ProviderChargeResult("st_" + UUID.randomUUID().toString().substring(0, 8));
+    }
+}
+
+final class RazorpayProvider implements PaymentProvider {
+    private final Random rnd;
+    RazorpayProvider(Random rnd) { this.rnd = Objects.requireNonNull(rnd); }
+
+    public String name() { return "Razorpay"; }
+
+    public Set<PaymentMethod> supportedMethods() {
+        return EnumSet.of(PaymentMethod.UPI, PaymentMethod.NET_BANKING, PaymentMethod.CREDIT_CARD, PaymentMethod.DEBIT_CARD);
+    }
+
+    public ProviderChargeResult charge(Payment payment, PaymentRequest request) {
+        if (rnd.nextInt(100) < 25) throw new ProviderException("Razorpay provider timeout");
+        System.out.println("Razorpay charged: " + request.amount + " " + request.currency + " via " + request.method);
+        return new ProviderChargeResult("rzp_" + UUID.randomUUID().toString().substring(0, 8));
+    }
+}
+
+final class PaypalProvider implements PaymentProvider {
+    private final Random rnd;
+    PaypalProvider(Random rnd) { this.rnd = Objects.requireNonNull(rnd); }
+
+    public String name() { return "PayPal"; }
+
+    public Set<PaymentMethod> supportedMethods() {
+        return EnumSet.of(PaymentMethod.WALLET, PaymentMethod.CREDIT_CARD, PaymentMethod.DEBIT_CARD);
+    }
+
+    public ProviderChargeResult charge(Payment payment, PaymentRequest request) {
+        if (rnd.nextInt(100) < 30) throw new ProviderException("PayPal rejected transaction");
+        System.out.println("PayPal charged: " + request.amount + " " + request.currency + " via " + request.method);
+        return new ProviderChargeResult("pp_" + UUID.randomUUID().toString().substring(0, 8));
+    }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Provider Registry (method -> list of providers) + Router + Health
+// ─────────────────────────────────────────────────────────────────────────────
+final class ProviderRegistry {
+    private final Map<PaymentMethod, List<PaymentProvider>> providers = new EnumMap<>(PaymentMethod.class);
+
+    public void register(PaymentProvider provider) {
+        Objects.requireNonNull(provider, "provider");
+        for (PaymentMethod method : provider.supportedMethods()) {
+            providers.computeIfAbsent(method, m -> new ArrayList<>()).add(provider);
+        }
+    }
+
+    public List<PaymentProvider> getProviders(PaymentMethod method) {
+        return providers.getOrDefault(method, Collections.<PaymentProvider>emptyList());
+    }
+}
+
+final class ProviderHealth {
+    private final Map<String, Integer> consecutiveFailures = new ConcurrentHashMap<>();
+    private final int failureThreshold;
+
+    ProviderHealth(int failureThreshold) { this.failureThreshold = Math.max(1, failureThreshold); }
+
+    boolean isHealthy(String provider) { return consecutiveFailures.getOrDefault(provider, 0) < failureThreshold; }
+    void recordSuccess(String provider) { consecutiveFailures.put(provider, 0); }
+    void recordFailure(String provider) { consecutiveFailures.merge(provider, 1, Integer::sum); }
+}
+
+interface ProviderRouter {
+    List<PaymentProvider> routeCandidates(PaymentMethod method);
+}
+
+final class RoundRobinRouter implements ProviderRouter {
+    private final ProviderRegistry registry;
+    private final ProviderHealth health;
+    private final Map<PaymentMethod, AtomicInteger> rr = new EnumMap<>(PaymentMethod.class);
+
+    RoundRobinRouter(ProviderRegistry registry, ProviderHealth health) {
+        this.registry = Objects.requireNonNull(registry);
+        this.health = Objects.requireNonNull(health);
+        for (PaymentMethod m : PaymentMethod.values()) rr.put(m, new AtomicInteger(0));
+    }
+
+    @Override
+    public List<PaymentProvider> routeCandidates(PaymentMethod method) {
+        List<PaymentProvider> list = new ArrayList<>(registry.getProviders(method));
+        if (list.isEmpty()) return Collections.emptyList();
+
+        // prefer healthy providers
+        List<PaymentProvider> healthy = new ArrayList<>();
+        for (PaymentProvider p : list) if (health.isHealthy(p.name())) healthy.add(p);
+        if (!healthy.isEmpty()) list = healthy;
+
+        // rotate list
+        int start = Math.floorMod(rr.get(method).getAndIncrement(), list.size());
+        List<PaymentProvider> ordered = new ArrayList<>(list.size());
+        ordered.addAll(list.subList(start, list.size()));
+        ordered.addAll(list.subList(0, start));
+        return ordered;
+    }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Retry Policy
+// ─────────────────────────────────────────────────────────────────────────────
+final class RetryPolicy {
+    final int maxAttempts; // total provider attempts for this payment
+    RetryPolicy(int maxAttempts) {
+        if (maxAttempts <= 0) throw new IllegalArgumentException("maxAttempts must be > 0");
+        this.maxAttempts = maxAttempts;
+    }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Orchestrator (idempotency + routing + provider failover + retries up to 3)
 // ─────────────────────────────────────────────────────────────────────────────
 final class PaymentOrchestrator {
     private final PaymentGateway gateway;
     private final PaymentRepository repo;
-    private final Map<PaymentMethod, PaymentService> methodValidators;
+    private final Map<PaymentMethod, PaymentService> validators;
     private final ProviderRouter router;
     private final ProviderHealth health;
+    private final RetryPolicy retryPolicy;
 
     PaymentOrchestrator(PaymentGateway gateway,
                         PaymentRepository repo,
                         Map<PaymentMethod, PaymentService> validators,
                         ProviderRouter router,
-                        ProviderHealth health) {
+                        ProviderHealth health,
+                        RetryPolicy retryPolicy) {
         this.gateway = Objects.requireNonNull(gateway);
         this.repo = Objects.requireNonNull(repo);
-        this.methodValidators = new EnumMap<>(PaymentMethod.class);
-        if (validators != null) this.methodValidators.putAll(validators);
+        this.validators = new EnumMap<>(PaymentMethod.class);
+        if (validators != null) this.validators.putAll(validators);
         this.router = Objects.requireNonNull(router);
         this.health = Objects.requireNonNull(health);
+        this.retryPolicy = Objects.requireNonNull(retryPolicy);
     }
 
-    // API: Initiate a payment (idempotent)
     PaymentResponse initiatePayment(PaymentRequest req) {
         Objects.requireNonNull(req, "request");
 
         Client c = gateway.getClient(req.client);
         if (!c.supports(req.method)) throw new IllegalArgumentException(req.method + " not supported for " + req.client);
 
-        PaymentService validator = methodValidators.get(req.method);
+        PaymentService validator = validators.get(req.method);
         if (validator == null) throw new IllegalStateException("No validator registered for " + req.method);
         validator.validate(req);
 
-        // Idempotency: same key returns same payment + does NOT re-charge
+        // Idempotency: same key => same Payment returned; no re-charge
         Payment existing = repo.findByIdempotency(req.client, req.idempotencyKey);
         if (existing != null) return new PaymentResponse(existing.getId(), existing.getStatus());
 
         Payment payment = repo.createIfAbsent(req.client, req.method, req.amount, req.currency, req.idempotencyKey);
 
-        // If already completed (race), just return
+        // race safety
         if (payment.getStatus() == PaymentStatus.SUCCESS || payment.getStatus() == PaymentStatus.FAILED) {
             return new PaymentResponse(payment.getId(), payment.getStatus());
         }
 
-        // Route + failover
-        List<PaymentProvider> candidates = router.routeCandidates(req.method);
-        if (candidates.isEmpty()) {
-            payment.markFailed("No providers available for " + req.method);
-            return new PaymentResponse(payment.getId(), payment.getStatus());
-        }
-
+        int attemptNo = 0;
         String lastErr = null;
-        for (PaymentProvider p : candidates) {
-            try {
-                payment.markProcessing(p.name());
-                payment.addAttempt("TRY " + p.name());
 
-                ProviderChargeResult res = p.charge(payment, req);
-
-                health.recordSuccess(p.name());
-                payment.addAttempt("OK " + p.name());
-                payment.markSuccess(p.name(), res.providerRef);
-
+        while (attemptNo < retryPolicy.maxAttempts) {
+            List<PaymentProvider> candidates = router.routeCandidates(req.method);
+            if (candidates.isEmpty()) {
+                payment.markFailed("No providers available for " + req.method);
                 return new PaymentResponse(payment.getId(), payment.getStatus());
-            } catch (ProviderException ex) {
-                health.recordFailure(p.name());
-                lastErr = p.name() + ": " + ex.getMessage();
-                payment.addAttempt("FAIL " + lastErr);
-                // continue to next provider
-            } catch (RuntimeException ex) {
-                // treat as provider failure for demo
-                health.recordFailure(p.name());
-                lastErr = p.name() + ": " + ex.getMessage();
-                payment.addAttempt("FAIL " + lastErr);
             }
+
+            boolean triedSomething = false;
+
+            for (PaymentProvider p : candidates) {
+                if (attemptNo >= retryPolicy.maxAttempts) break;
+
+                attemptNo++;
+                triedSomething = true;
+
+                // record TRY
+                payment.addAttempt(Attempt.tryAttempt(attemptNo, p.name()));
+
+                try {
+                    payment.markProcessing(p.name()); // CREATED -> PROCESSING
+
+                    ProviderChargeResult res = p.charge(payment, req);
+
+                    health.recordSuccess(p.name());
+                    payment.addAttempt(Attempt.successAttempt(attemptNo, p.name()));
+
+                    payment.markSuccess(p.name(), res.providerRef); // PROCESSING -> SUCCESS
+                    return new PaymentResponse(payment.getId(), payment.getStatus());
+
+                } catch (ProviderException ex) {
+                    health.recordFailure(p.name());
+                    lastErr = p.name() + ": " + ex.getMessage();
+                    payment.addAttempt(Attempt.failAttempt(attemptNo, p.name(), ex.getMessage()));
+                } catch (RuntimeException ex) {
+                    health.recordFailure(p.name());
+                    lastErr = p.name() + ": " + ex.getMessage();
+                    payment.addAttempt(Attempt.failAttempt(attemptNo, p.name(), ex.getMessage()));
+                }
+            }
+
+            if (!triedSomething) break;
         }
 
-        payment.markFailed(lastErr == null ? "All providers failed" : lastErr);
+        payment.markFailed(lastErr == null ? "All retries exhausted" : "All retries exhausted. Last=" + lastErr);
         return new PaymentResponse(payment.getId(), payment.getStatus());
     }
 
-    // API: Check status
     PaymentStatus getPaymentStatus(String paymentId) {
         return repo.findById(paymentId).getStatus();
-    }
-
-    // Optional convenience: status by idempotency key
-    PaymentStatus getPaymentStatus(String client, String idempotencyKey) {
-        Payment p = repo.findByIdempotency(client, idempotencyKey);
-        if (p == null) throw new NoSuchElementException("No payment for idempotency key");
-        return p.getStatus();
     }
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// Thin API Facade (what controllers would call)
+// Thin API Facade
 // ─────────────────────────────────────────────────────────────────────────────
 final class PaymentApi {
     private final PaymentOrchestrator orchestrator;
@@ -506,7 +542,6 @@ final class PaymentApi {
     PaymentApi(PaymentOrchestrator orchestrator) { this.orchestrator = Objects.requireNonNull(orchestrator); }
 
     PaymentResponse initiatePayment(PaymentRequest req) { return orchestrator.initiatePayment(req); }
-
     PaymentStatus getPaymentStatus(String paymentId) { return orchestrator.getPaymentStatus(paymentId); }
 }
 
@@ -515,14 +550,10 @@ final class PaymentApi {
 // ─────────────────────────────────────────────────────────────────────────────
 public class PaymentGatewayApp {
     public static void main(String[] args) {
-        // Gateway + clients
+        // Gateway + client
         PaymentGateway gw = new PaymentGateway();
         Client flipkart = new Client("Flipkart");
-        flipkart.addMethod(PaymentMethod.CREDIT_CARD);
-        flipkart.addMethod(PaymentMethod.DEBIT_CARD);
-        flipkart.addMethod(PaymentMethod.UPI);
-        flipkart.addMethod(PaymentMethod.NET_BANKING);
-        flipkart.addMethod(PaymentMethod.WALLET);
+        for (PaymentMethod m : PaymentMethod.values()) flipkart.addMethod(m);
         gw.addClient(flipkart);
 
         // Providers
@@ -535,22 +566,23 @@ public class PaymentGatewayApp {
         ProviderHealth health = new ProviderHealth(3);
         ProviderRouter router = new RoundRobinRouter(registry, health);
 
-        // Method validators (Strategy stays like your original approach)
-        Map<PaymentMethod, PaymentService> validators = Map.of(
-            PaymentMethod.CREDIT_CARD, new CardPaymentService(PaymentMethod.CREDIT_CARD),
-            PaymentMethod.DEBIT_CARD, new CardPaymentService(PaymentMethod.DEBIT_CARD),
-            PaymentMethod.UPI, new UpiPaymentService(),
-            PaymentMethod.NET_BANKING, new NetBankingPaymentService(),
-            PaymentMethod.WALLET, new WalletPaymentService()
-        );
+        // Validators
+        Map<PaymentMethod, PaymentService> validators = new EnumMap<>(PaymentMethod.class);
+        validators.put(PaymentMethod.CREDIT_CARD, new CardPaymentService(PaymentMethod.CREDIT_CARD));
+        validators.put(PaymentMethod.DEBIT_CARD, new CardPaymentService(PaymentMethod.DEBIT_CARD));
+        validators.put(PaymentMethod.UPI, new UpiPaymentService());
+        validators.put(PaymentMethod.NET_BANKING, new NetBankingPaymentService());
+        validators.put(PaymentMethod.WALLET, new WalletPaymentService());
 
         PaymentRepository repo = new PaymentRepository();
-        PaymentOrchestrator orchestrator = new PaymentOrchestrator(gw, repo, validators, router, health);
+        RetryPolicy retryPolicy = new RetryPolicy(3); // ✅ retries up to 3 total provider attempts
+
+        PaymentOrchestrator orchestrator = new PaymentOrchestrator(gw, repo, validators, router, health, retryPolicy);
         PaymentApi api = new PaymentApi(orchestrator);
 
-        // Initiate payment (idempotent)
-        String idemKey = "order_123_payment_1"; // client should reuse on retries
-        PaymentRequest r1 = new PaymentRequest(
+        // Initiate
+        String idemKey = "order_123_payment_1";
+        PaymentRequest req = new PaymentRequest(
             "Flipkart",
             PaymentMethod.CREDIT_CARD,
             new CardDetails("4111111111111111", "123", "12/28", "Alice"),
@@ -559,13 +591,13 @@ public class PaymentGatewayApp {
             idemKey
         );
 
-        PaymentResponse resp1 = api.initiatePayment(r1);
-        System.out.println(resp1);
-        System.out.println("Status: " + api.getPaymentStatus(resp1.paymentId));
+        PaymentResponse r1 = api.initiatePayment(req);
+        System.out.println(r1);
+        System.out.println("Status: " + api.getPaymentStatus(r1.paymentId));
 
-        // Retry SAME request (same idempotencyKey) -> should NOT charge again; returns same paymentId/status
-        PaymentResponse resp2 = api.initiatePayment(r1);
-        System.out.println("Retry: " + resp2);
-        System.out.println("Same paymentId? " + resp1.paymentId.equals(resp2.paymentId));
+        // Retry same request -> idempotent: returns same paymentId/status, no extra charge attempt
+        PaymentResponse r2 = api.initiatePayment(req);
+        System.out.println("Retry same key: " + r2);
+        System.out.println("Same paymentId? " + r1.paymentId.equals(r2.paymentId));
     }
 }

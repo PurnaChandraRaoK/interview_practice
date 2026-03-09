@@ -1,4 +1,5 @@
 import java.util.*;
+import java.util.concurrent.locks.*;
 
 // ========================== ENUMS ==========================
 
@@ -29,7 +30,7 @@ final class Card {
 
     public String getCardNumber() { return cardNumber; }
 
-    Account getAccount() { return account; }         // package-private style
+    Account getAccount() { return account; }                   // package-private style
     void setAccount(Account account) { this.account = account; } // set only by Account
 
     public boolean validatePin(int enteredPin) { return pin == enteredPin; }
@@ -41,6 +42,7 @@ final class Account {
     private final String accountNumber;
     private int balance; // in ₹
     private final List<Card> cards = new ArrayList<>();
+    private final Lock lock = new ReentrantLock();
 
     public Account(String accountNumber, int balance) {
         this.accountNumber = Objects.requireNonNull(accountNumber);
@@ -48,7 +50,12 @@ final class Account {
     }
 
     public String getAccountNumber() { return accountNumber; }
-    public int getBalance() { return balance; }
+
+    public int getBalance() {
+        lock.lock();
+        try { return balance; }
+        finally { lock.unlock(); }
+    }
 
     public List<Card> getCards() { return Collections.unmodifiableList(cards); }
 
@@ -58,16 +65,27 @@ final class Account {
         cards.add(card);
     }
 
-    public boolean hasSufficientBalance(int amount) { return balance >= amount; }
-
-    public void debit(int amount) {
-        if (!hasSufficientBalance(amount)) {
-            throw new IllegalStateException("Insufficient balance.");
-        }
-        balance -= amount;
+    public boolean hasSufficientBalance(int amount) {
+        lock.lock();
+        try { return balance >= amount; }
+        finally { lock.unlock(); }
     }
 
-    public void credit(int amount) { balance += amount; }
+    public void debit(int amount) {
+        lock.lock();
+        try {
+            if (balance < amount) throw new IllegalStateException("Insufficient balance.");
+            balance -= amount;
+        } finally {
+            lock.unlock();
+        }
+    }
+
+    public void credit(int amount) {
+        lock.lock();
+        try { balance += amount; }
+        finally { lock.unlock(); }
+    }
 }
 
 // ========================== CASH INVENTORY ==========================
@@ -75,40 +93,66 @@ final class Account {
 final class CashInventory {
     private final EnumMap<DenominationType, Integer> inventory = new EnumMap<>(DenominationType.class);
 
+    private final Lock lock = new ReentrantLock();
+
     public CashInventory() {
         for (DenominationType d : DenominationType.values()) inventory.put(d, 0);
     }
 
+    Lock getLock() { return lock; }
+
     public int getCount(DenominationType denomination) {
-        return inventory.getOrDefault(denomination, 0);
+        lock.lock();
+        try { return inventory.getOrDefault(denomination, 0); }
+        finally { lock.unlock(); }
     }
 
     public void addNotes(DenominationType denomination, int count) {
         if (count <= 0) throw new IllegalArgumentException("Count must be positive.");
-        inventory.put(denomination, getCount(denomination) + count);
+        lock.lock();
+        try {
+            inventory.put(denomination, inventory.getOrDefault(denomination, 0) + count);
+        } finally {
+            lock.unlock();
+        }
     }
 
     public void removeNotes(DenominationType denomination, int count) {
-        int available = getCount(denomination);
-        if (available < count) throw new IllegalStateException("Not enough " + denomination + " notes in inventory.");
-        inventory.put(denomination, available - count);
+        lock.lock();
+        try {
+            int available = inventory.getOrDefault(denomination, 0);
+            if (available < count) throw new IllegalStateException("Not enough " + denomination + " notes in inventory.");
+            inventory.put(denomination, available - count);
+        } finally {
+            lock.unlock();
+        }
     }
 
     public long getTotalCash() {
-        long total = 0;
-        for (Map.Entry<DenominationType, Integer> e : inventory.entrySet()) {
-            total += (long) e.getKey().getValue() * e.getValue();
+        lock.lock();
+        try {
+            long total = 0;
+            for (Map.Entry<DenominationType, Integer> e : inventory.entrySet()) {
+                total += (long) e.getKey().getValue() * e.getValue();
+            }
+            return total;
+        } finally {
+            lock.unlock();
         }
-        return total;
     }
 
     public void printInventory() {
-        System.out.println("--- ATM Cash Inventory ---");
-        for (DenominationType d : DenominationType.values()) {
-            int c = getCount(d);
-            System.out.println("  ₹" + d.getValue() + " x " + c + " = ₹" + (long) d.getValue() * c);
+        lock.lock();
+        try {
+            System.out.println("--- ATM Cash Inventory ---");
+            for (DenominationType d : DenominationType.values()) {
+                int c = inventory.getOrDefault(d, 0);
+                System.out.println("  ₹" + d.getValue() + " x " + c + " = ₹" + (long) d.getValue() * c);
+            }
+            System.out.println("  Total: ₹" + getTotalCash());
+        } finally {
+            lock.unlock();
         }
-        System.out.println("  Total: ₹" + getTotalCash());
     }
 }
 
@@ -218,14 +262,18 @@ final class CashDispenser {
     }
 
     public EnumMap<DenominationType, Integer> dispense(int amount, CashInventory inventory) {
-        EnumMap<DenominationType, Integer> dispensed = new EnumMap<>(DenominationType.class);
-        chain.dispense(amount, inventory, dispensed);
+        inventory.getLock().lock();
+        try {
+            EnumMap<DenominationType, Integer> dispensed = new EnumMap<>(DenominationType.class);
+            chain.dispense(amount, inventory, dispensed);
 
-        // Commit: remove notes after successful calculation
-        for (Map.Entry<DenominationType, Integer> e : dispensed.entrySet()) {
-            inventory.removeNotes(e.getKey(), e.getValue());
+            for (Map.Entry<DenominationType, Integer> e : dispensed.entrySet()) {
+                inventory.removeNotes(e.getKey(), e.getValue());
+            }
+            return dispensed;
+        } finally {
+            inventory.getLock().unlock();
         }
-        return dispensed;
     }
 }
 
@@ -478,6 +526,8 @@ final class ATMMachine {
     private final CashInventory inventory = new CashInventory();
     private final CashDispenser dispenser = new CashDispenser();
 
+    private final Lock sessionLock = new ReentrantLock(true);
+
     public void setState(ATMState state) { this.currentState = state; }
     public void setCurrentCard(Card card) { this.currentCard = card; }
     public Card getCurrentCard() { return currentCard; }
@@ -485,18 +535,57 @@ final class ATMMachine {
     public CashInventory getInventory() { return inventory; }
     public CashDispenser getDispenser() { return dispenser; }
 
-    // Delegated operations to current state
-    public void insertCard(Card card) { currentState.insertCard(this, card); }
-    public void enterPin(int pin) { currentState.enterPin(this, pin); }
-    public void selectTransaction(TransactionType type) { currentState.selectTransaction(this, type); }
-    public void withdrawCash(int amount) { currentState.withdrawCash(this, amount); }
-    public void depositCash(DenominationType denomination, int count) { currentState.depositCash(this, denomination, count); }
-    public void changePin(int oldPin, int newPin) { currentState.changePin(this, oldPin, newPin); }
-    public void ejectCard() { currentState.ejectCard(this); }
+    // Delegated operations to current state (all serialized by sessionLock)
+    public void insertCard(Card card) {
+        sessionLock.lock();
+        try { currentState.insertCard(this, card); }
+        finally { sessionLock.unlock(); }
+    }
+
+    public void enterPin(int pin) {
+        sessionLock.lock();
+        try { currentState.enterPin(this, pin); }
+        finally { sessionLock.unlock(); }
+    }
+
+    public void selectTransaction(TransactionType type) {
+        sessionLock.lock();
+        try { currentState.selectTransaction(this, type); }
+        finally { sessionLock.unlock(); }
+    }
+
+    public void withdrawCash(int amount) {
+        sessionLock.lock();
+        try { currentState.withdrawCash(this, amount); }
+        finally { sessionLock.unlock(); }
+    }
+
+    public void depositCash(DenominationType denomination, int count) {
+        sessionLock.lock();
+        try { currentState.depositCash(this, denomination, count); }
+        finally { sessionLock.unlock(); }
+    }
+
+    public void changePin(int oldPin, int newPin) {
+        sessionLock.lock();
+        try { currentState.changePin(this, oldPin, newPin); }
+        finally { sessionLock.unlock(); }
+    }
+
+    public void ejectCard() {
+        sessionLock.lock();
+        try { currentState.ejectCard(this); }
+        finally { sessionLock.unlock(); }
+    }
 
     public void loadCash(DenominationType denomination, int count) {
-        inventory.addNotes(denomination, count);
-        System.out.println("Loaded " + count + " x ₹" + denomination.getValue() + " notes into ATM.");
+        sessionLock.lock();
+        try {
+            inventory.addNotes(denomination, count);
+            System.out.println("Loaded " + count + " x ₹" + denomination.getValue() + " notes into ATM.");
+        } finally {
+            sessionLock.unlock();
+        }
     }
 }
 

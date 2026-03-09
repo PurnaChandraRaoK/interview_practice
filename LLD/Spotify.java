@@ -2,29 +2,26 @@ import java.util.*;
 import java.util.concurrent.ConcurrentHashMap;
 
 /**
- * Spotify LLD (simple, interview-ready)
- * Added: Artist, Album, basic relations, playAlbum/playArtist
- * Focus: flow + correctness (queue, shuffle, repeat, player state)
+ * FINAL: Spotify LLD (simple, interview-ready)
+ * Includes:
+ * - Artist, Album, Song, Playlist
+ * - Playback: queue, shuffle, repeat, state machine
+ * - Library: likes, recents
+ * - Subscription + Charges: user must subscribe before listening
+ *
+ * NOTE: Minimal implementation by design (LLD focus).
  */
-public class SpotifyLLD {
+public class SpotifyFinalLLD {
 
-    // ---------- Domain ----------
-    static final class Song {
+    // -------------------- Domain --------------------
+    static final class User {
         final String id;
-        final String title;
-        final int durationSec;
-        final String albumId;                 // link
-        final List<String> artistIds;         // link
+        final String name;
 
-        Song(String id, String title, int durationSec, String albumId, List<String> artistIds) {
+        User(String id, String name) {
             this.id = Objects.requireNonNull(id);
-            this.title = Objects.requireNonNull(title);
-            this.durationSec = durationSec;
-            this.albumId = albumId; // can be null
-            this.artistIds = (artistIds == null) ? List.of() : List.copyOf(artistIds);
+            this.name = Objects.requireNonNull(name);
         }
-
-        @Override public String toString() { return title + " (" + id + ")"; }
     }
 
     static final class Artist {
@@ -36,14 +33,14 @@ public class SpotifyLLD {
             this.name = Objects.requireNonNull(name);
         }
 
-        @Override public String toString() { return name + " (" + id + ")"; }
+        @Override public String toString() { return name + "(" + id + ")"; }
     }
 
     static final class Album {
         final String id;
         final String name;
         final List<String> artistIds;
-        final List<String> songIds = new ArrayList<>();
+        private final List<String> songIds = new ArrayList<>();
 
         Album(String id, String name, List<String> artistIds) {
             this.id = Objects.requireNonNull(id);
@@ -51,28 +48,36 @@ public class SpotifyLLD {
             this.artistIds = (artistIds == null) ? List.of() : List.copyOf(artistIds);
         }
 
-        public List<String> songIdsView() { return Collections.unmodifiableList(songIds); }
         void addSong(String songId) { songIds.add(songId); }
+        List<String> songIdsView() { return Collections.unmodifiableList(songIds); }
 
-        @Override public String toString() { return name + " (" + id + ")"; }
+        @Override public String toString() { return name + "(" + id + ")"; }
     }
 
-    static final class User {
+    static final class Song {
         final String id;
-        final String name;
+        final String title;
+        final int durationSec;
+        final String albumId;           // link
+        final List<String> artistIds;   // link
 
-        User(String id, String name) {
+        Song(String id, String title, int durationSec, String albumId, List<String> artistIds) {
             this.id = Objects.requireNonNull(id);
-            this.name = Objects.requireNonNull(name);
+            this.title = Objects.requireNonNull(title);
+            this.durationSec = durationSec;
+            this.albumId = albumId; // can be null
+            this.artistIds = (artistIds == null) ? List.of() : List.copyOf(artistIds);
         }
+
+        @Override public String toString() { return title + "(" + id + ")"; }
     }
 
     static final class Playlist {
         final String id;
         final String ownerUserId;
         final String name;
-        private final List<String> songIds = new ArrayList<>();
         private boolean isPublic;
+        private final List<String> songIds = new ArrayList<>();
 
         Playlist(String id, String ownerUserId, String name, boolean isPublic) {
             this.id = Objects.requireNonNull(id);
@@ -81,38 +86,34 @@ public class SpotifyLLD {
             this.isPublic = isPublic;
         }
 
-        public List<String> songIdsView() { return Collections.unmodifiableList(songIds); }
-        public boolean isPublic() { return isPublic; }
-        public void setPublic(boolean aPublic) { isPublic = aPublic; }
-
         void addSong(String songId) { songIds.add(songId); }
         void removeSong(String songId) { songIds.remove(songId); }
+
         void move(int fromIdx, int toIdx) {
             if (fromIdx < 0 || fromIdx >= songIds.size() || toIdx < 0 || toIdx >= songIds.size()) return;
             String s = songIds.remove(fromIdx);
             songIds.add(toIdx, s);
         }
+
+        List<String> songIdsView() { return Collections.unmodifiableList(songIds); }
+        boolean isPublic() { return isPublic; }
+        void setPublic(boolean val) { isPublic = val; }
     }
 
-    enum RepeatMode { OFF, ONE, ALL }
-
-    // ---------- Catalog ----------
+    // -------------------- Catalog --------------------
     interface Catalog {
         Song getSong(String songId);
         Artist getArtist(String artistId);
         Album getAlbum(String albumId);
 
-        List<Song> searchSongByTitlePrefix(String prefix);
-        List<Artist> searchArtistByNamePrefix(String prefix);
-        List<Album> searchAlbumByNamePrefix(String prefix);
-
         List<String> songsOfAlbum(String albumId);
         List<String> songsOfArtist(String artistId);
+
+        List<Song> searchSongTitlePrefix(String prefix);
+        List<Artist> searchArtistNamePrefix(String prefix);
+        List<Album> searchAlbumNamePrefix(String prefix);
     }
 
-    /**
-     * In-memory catalog. Minimal indexes (prefix scan + precomputed mapping artist->songs).
-     */
     static final class InMemoryCatalog implements Catalog {
         private final Map<String, Song> songs = new HashMap<>();
         private final Map<String, Artist> artists = new HashMap<>();
@@ -122,7 +123,6 @@ public class SpotifyLLD {
         private final List<Artist> allArtists = new ArrayList<>();
         private final List<Album> allAlbums = new ArrayList<>();
 
-        // artistId -> songIds (derived at insert time)
         private final Map<String, List<String>> artistToSongs = new HashMap<>();
 
         public void addArtist(Artist a) {
@@ -139,13 +139,11 @@ public class SpotifyLLD {
             songs.put(s.id, s);
             allSongs.add(s);
 
-            // wire song into album
             if (s.albumId != null) {
                 Album al = albums.get(s.albumId);
                 if (al != null) al.addSong(s.id);
             }
 
-            // wire song into artists mapping
             for (String artistId : s.artistIds) {
                 artistToSongs.computeIfAbsent(artistId, k -> new ArrayList<>()).add(s.id);
             }
@@ -155,27 +153,6 @@ public class SpotifyLLD {
         @Override public Artist getArtist(String artistId) { return artists.get(artistId); }
         @Override public Album getAlbum(String albumId) { return albums.get(albumId); }
 
-        @Override public List<Song> searchSongByTitlePrefix(String prefix) {
-            String p = (prefix == null) ? "" : prefix.toLowerCase();
-            List<Song> res = new ArrayList<>();
-            for (Song s : allSongs) if (s.title.toLowerCase().startsWith(p)) res.add(s);
-            return res;
-        }
-
-        @Override public List<Artist> searchArtistByNamePrefix(String prefix) {
-            String p = (prefix == null) ? "" : prefix.toLowerCase();
-            List<Artist> res = new ArrayList<>();
-            for (Artist a : allArtists) if (a.name.toLowerCase().startsWith(p)) res.add(a);
-            return res;
-        }
-
-        @Override public List<Album> searchAlbumByNamePrefix(String prefix) {
-            String p = (prefix == null) ? "" : prefix.toLowerCase();
-            List<Album> res = new ArrayList<>();
-            for (Album a : allAlbums) if (a.name.toLowerCase().startsWith(p)) res.add(a);
-            return res;
-        }
-
         @Override public List<String> songsOfAlbum(String albumId) {
             Album a = albums.get(albumId);
             return (a == null) ? List.of() : a.songIdsView();
@@ -184,9 +161,30 @@ public class SpotifyLLD {
         @Override public List<String> songsOfArtist(String artistId) {
             return List.copyOf(artistToSongs.getOrDefault(artistId, List.of()));
         }
+
+        @Override public List<Song> searchSongTitlePrefix(String prefix) {
+            String p = (prefix == null) ? "" : prefix.toLowerCase();
+            List<Song> res = new ArrayList<>();
+            for (Song s : allSongs) if (s.title.toLowerCase().startsWith(p)) res.add(s);
+            return res;
+        }
+
+        @Override public List<Artist> searchArtistNamePrefix(String prefix) {
+            String p = (prefix == null) ? "" : prefix.toLowerCase();
+            List<Artist> res = new ArrayList<>();
+            for (Artist a : allArtists) if (a.name.toLowerCase().startsWith(p)) res.add(a);
+            return res;
+        }
+
+        @Override public List<Album> searchAlbumNamePrefix(String prefix) {
+            String p = (prefix == null) ? "" : prefix.toLowerCase();
+            List<Album> res = new ArrayList<>();
+            for (Album a : allAlbums) if (a.name.toLowerCase().startsWith(p)) res.add(a);
+            return res;
+        }
     }
 
-    // ---------- Library (likes + recents) ----------
+    // -------------------- Library (Likes + Recents) --------------------
     static final class LibraryService {
         private final int recentLimit;
         private final Map<String, LinkedHashSet<String>> liked = new ConcurrentHashMap<>();
@@ -194,72 +192,200 @@ public class SpotifyLLD {
 
         LibraryService(int recentLimit) { this.recentLimit = recentLimit; }
 
-        public void like(String userId, String songId) {
+        void like(String userId, String songId) {
             liked.computeIfAbsent(userId, k -> new LinkedHashSet<>()).add(songId);
         }
 
-        public void unlike(String userId, String songId) {
+        void unlike(String userId, String songId) {
             liked.computeIfAbsent(userId, k -> new LinkedHashSet<>()).remove(songId);
         }
 
-        public List<String> likedSongs(String userId) {
+        List<String> likedSongs(String userId) {
             return new ArrayList<>(liked.getOrDefault(userId, new LinkedHashSet<>()));
         }
 
-        public void addRecent(String userId, String songId) {
+        void addRecent(String userId, String songId) {
             Deque<String> dq = recents.computeIfAbsent(userId, k -> new ArrayDeque<>());
-            dq.remove(songId);      // unique
+            dq.remove(songId);
             dq.addFirst(songId);
             while (dq.size() > recentLimit) dq.removeLast();
         }
 
-        public List<String> recentlyPlayed(String userId) {
+        List<String> recentlyPlayed(String userId) {
             return new ArrayList<>(recents.getOrDefault(userId, new ArrayDeque<>()));
         }
     }
 
-    // ---------- Playlist Service ----------
+    // -------------------- Playlist Service --------------------
     static final class PlaylistService {
         private final Map<String, Playlist> playlists = new ConcurrentHashMap<>();
 
-        public Playlist create(String ownerUserId, String name, boolean isPublic) {
+        Playlist create(String ownerUserId, String name, boolean isPublic) {
             String id = UUID.randomUUID().toString();
             Playlist p = new Playlist(id, ownerUserId, name, isPublic);
             playlists.put(id, p);
             return p;
         }
 
-        public Playlist get(String playlistId) { return playlists.get(playlistId); }
+        Playlist get(String playlistId) { return playlists.get(playlistId); }
 
-        public void delete(String playlistId, String requesterUserId) {
+        void delete(String playlistId, String requesterUserId) {
             Playlist p = playlists.get(playlistId);
             if (p != null && p.ownerUserId.equals(requesterUserId)) playlists.remove(playlistId);
         }
 
-        public void addSong(String playlistId, String requesterUserId, String songId) {
+        void addSong(String playlistId, String requesterUserId, String songId) {
             Playlist p = playlists.get(playlistId);
             if (p != null && p.ownerUserId.equals(requesterUserId)) p.addSong(songId);
         }
 
-        public void removeSong(String playlistId, String requesterUserId, String songId) {
+        void removeSong(String playlistId, String requesterUserId, String songId) {
             Playlist p = playlists.get(playlistId);
             if (p != null && p.ownerUserId.equals(requesterUserId)) p.removeSong(songId);
         }
 
-        public void reorder(String playlistId, String requesterUserId, int fromIdx, int toIdx) {
+        void reorder(String playlistId, String requesterUserId, int fromIdx, int toIdx) {
             Playlist p = playlists.get(playlistId);
             if (p != null && p.ownerUserId.equals(requesterUserId)) p.move(fromIdx, toIdx);
         }
     }
 
-    // ---------- Playback ----------
+    // -------------------- Subscription + Charges --------------------
+    enum SubscriptionPlan { FREE, PREMIUM }
+    enum SubscriptionStatus { ACTIVE, EXPIRED, CANCELLED }
+    enum ChargeStatus { SUCCESS, FAILED }
+    enum Currency { INR, USD }
+
+    static final class Subscription {
+        final String userId;
+        final SubscriptionPlan plan;
+        final Date start;
+        final Date end;
+        SubscriptionStatus status;
+
+        Subscription(String userId, SubscriptionPlan plan, Date start, Date end) {
+            this.userId = userId;
+            this.plan = plan;
+            this.start = start;
+            this.end = end;
+            this.status = SubscriptionStatus.ACTIVE;
+        }
+
+        boolean isActiveNow() {
+            return status == SubscriptionStatus.ACTIVE && new Date().before(end);
+        }
+    }
+
+    static final class Charge {
+        final String id;
+        final String userId;
+        final double amount;
+        final Currency currency;
+        final Date at;
+        final ChargeStatus status;
+        final String description;
+
+        Charge(String userId, double amount, Currency currency, ChargeStatus status, String description) {
+            this.id = UUID.randomUUID().toString();
+            this.userId = userId;
+            this.amount = amount;
+            this.currency = currency;
+            this.at = new Date();
+            this.status = status;
+            this.description = description;
+        }
+
+        @Override public String toString() {
+            return "Charge{id=" + id + ", amount=" + amount + " " + currency + ", status=" + status + ", desc=" + description + "}";
+        }
+    }
+
+    // Strategy (pricing)
+    interface PricingStrategy {
+        double priceFor(SubscriptionPlan plan);
+        Currency currency();
+    }
+
+    static final class DefaultPricingStrategy implements PricingStrategy {
+        public double priceFor(SubscriptionPlan plan) {
+            switch (plan) {
+                case FREE: return 0.0;
+                case PREMIUM: return 199.0; // monthly (LLD)
+                default: return 0.0;
+            }
+        }
+        public Currency currency() { return Currency.INR; }
+    }
+
+    interface PaymentService {
+        boolean charge(String userId, double amount, Currency currency);
+    }
+
+    static final class DummyPaymentService implements PaymentService {
+        public boolean charge(String userId, double amount, Currency currency) {
+            return true; // always success (LLD)
+        }
+    }
+
+    static final class SubscriptionService {
+        private final Map<String, Subscription> subs = new ConcurrentHashMap<>();
+        private final Map<String, List<Charge>> charges = new ConcurrentHashMap<>();
+        private final PricingStrategy pricing;
+        private final PaymentService payment;
+
+        SubscriptionService(PricingStrategy pricing, PaymentService payment) {
+            this.pricing = pricing;
+            this.payment = payment;
+        }
+
+        Subscription subscribeMonthly(String userId, SubscriptionPlan plan) {
+            double amount = pricing.priceFor(plan);
+            Currency cur = pricing.currency();
+
+            boolean ok = payment.charge(userId, amount, cur);
+            Charge c = new Charge(userId, amount, cur, ok ? ChargeStatus.SUCCESS : ChargeStatus.FAILED,
+                    "Subscription purchase: " + plan);
+            charges.computeIfAbsent(userId, k -> new ArrayList<>()).add(c);
+
+            if (!ok) throw new IllegalStateException("Payment failed");
+
+            Date now = new Date();
+            Calendar cal = Calendar.getInstance();
+            cal.setTime(now);
+            cal.add(Calendar.MONTH, 1);
+
+            Subscription s = new Subscription(userId, plan, now, cal.getTime());
+            subs.put(userId, s);
+            return s;
+        }
+
+        boolean hasActiveSubscription(String userId) {
+            Subscription s = subs.get(userId);
+            if (s == null) return false;
+            if (!s.isActiveNow()) {
+                s.status = SubscriptionStatus.EXPIRED;
+                return false;
+            }
+            return true;
+        }
+
+        Subscription getSubscription(String userId) { return subs.get(userId); }
+
+        List<Charge> getCharges(String userId) {
+            return List.copyOf(charges.getOrDefault(userId, List.of()));
+        }
+    }
+
+    // -------------------- Playback --------------------
+    enum RepeatMode { OFF, ONE, ALL }
+
     interface PlaybackListener {
         void onNowPlaying(String userId, Song song);
         void onStateChanged(String userId, String state);
         void onPositionChanged(String userId, int positionSec);
     }
 
-    // Strategy
+    // Strategy: order (normal/shuffle)
     interface OrderStrategy {
         int nextIndex(int currentIndex, int size, Random rnd);
         int prevIndex(int currentIndex, int size, Random rnd);
@@ -280,13 +406,12 @@ public class SpotifyLLD {
             return nxt;
         }
         public int prevIndex(int currentIndex, int size, Random rnd) {
-            // keep simple: random prev (no history stack)
-            return nextIndex(currentIndex, size, rnd);
+            return nextIndex(currentIndex, size, rnd); // no history (simple)
         }
         public String name() { return "SHUFFLE"; }
     }
 
-    // State
+    // State: playing/paused/stopped
     interface PlayerState {
         void play(PlaybackSession s);
         void pause(PlaybackSession s);
@@ -315,11 +440,6 @@ public class SpotifyLLD {
         public String name() { return "STOPPED"; }
     }
 
-    /**
-     * PlaybackSession = per user.
-     * Context can be: single song, playlist, album, artist (list of songIds).
-     * Queue overrides context: playNext then upNext.
-     */
     static final class PlaybackSession {
         private final String userId;
         private final Catalog catalog;
@@ -328,13 +448,13 @@ public class SpotifyLLD {
 
         private PlayerState state = new StoppedState();
         private RepeatMode repeatMode = RepeatMode.OFF;
-        private OrderStrategy orderStrategy = new NormalOrder();
+        private OrderStrategy order = new NormalOrder();
 
-        // context list (playlist/album/artist)
+        // context list (playlist/album/artist/single)
         private List<String> contextSongIds = List.of();
         private int contextIndex = -1;
 
-        // queue
+        // queue overrides context
         private final Deque<String> playNext = new ArrayDeque<>();
         private final Deque<String> upNext = new ArrayDeque<>();
 
@@ -349,15 +469,15 @@ public class SpotifyLLD {
             this.library = library;
         }
 
-        public void addListener(PlaybackListener l) { if (l != null) listeners.add(l); }
+        void addListener(PlaybackListener l) { if (l != null) listeners.add(l); }
 
         void setState(PlayerState newState) {
             this.state = newState;
             for (PlaybackListener l : listeners) l.onStateChanged(userId, state.name());
         }
 
-        // --- commands ---
-        public void playSong(String songId) {
+        // --- playback entry points ---
+        void playSong(String songId) {
             if (catalog.getSong(songId) == null) return;
             this.contextSongIds = List.of(songId);
             this.contextIndex = 0;
@@ -365,9 +485,10 @@ public class SpotifyLLD {
             state.play(this);
         }
 
-        public void playContext(List<String> songIds, int startIndex) {
+        void playContext(List<String> songIds, int startIndex) {
             if (songIds == null || songIds.isEmpty()) return;
-            // filter invalid songs (correctness)
+
+            // filter invalid song ids (correctness)
             List<String> valid = new ArrayList<>();
             for (String id : songIds) if (catalog.getSong(id) != null) valid.add(id);
             if (valid.isEmpty()) return;
@@ -378,11 +499,11 @@ public class SpotifyLLD {
             state.play(this);
         }
 
-        public void resume() { state.play(this); }
-        public void pause() { state.pause(this); }
-        public void stop() { state.stop(this); }
+        void resume() { state.play(this); }
+        void pause() { state.pause(this); }
+        void stop() { state.stop(this); }
 
-        public void seek(int newPositionSec) {
+        void seek(int newPositionSec) {
             if (currentSongId == null) return;
             Song s = catalog.getSong(currentSongId);
             if (s == null) return;
@@ -390,36 +511,31 @@ public class SpotifyLLD {
             for (PlaybackListener l : listeners) l.onPositionChanged(userId, positionSec);
         }
 
-        public void setShuffle(boolean enabled) {
-            this.orderStrategy = enabled ? new ShuffleOrder() : new NormalOrder();
-        }
+        void setShuffle(boolean enabled) { this.order = enabled ? new ShuffleOrder() : new NormalOrder(); }
+        void setRepeatMode(RepeatMode mode) { this.repeatMode = (mode == null) ? RepeatMode.OFF : mode; }
 
-        public void setRepeatMode(RepeatMode mode) {
-            this.repeatMode = (mode == null) ? RepeatMode.OFF : mode;
-        }
-
-        public void addToQueueNext(String songId) {
+        void addToQueueNext(String songId) {
             if (catalog.getSong(songId) == null) return;
             playNext.addLast(songId);
         }
 
-        public void addToQueueEnd(String songId) {
+        void addToQueueEnd(String songId) {
             if (catalog.getSong(songId) == null) return;
             upNext.addLast(songId);
         }
 
-        public void clearQueue() { playNext.clear(); upNext.clear(); }
+        void clearQueue() { playNext.clear(); upNext.clear(); }
 
-        public List<String> viewUpNext() {
+        List<String> viewUpNext() {
             List<String> res = new ArrayList<>(playNext);
             res.addAll(upNext);
             return res;
         }
 
-        public Song nowPlaying() { return currentSongId == null ? null : catalog.getSong(currentSongId); }
+        Song nowPlaying() { return currentSongId == null ? null : catalog.getSong(currentSongId); }
 
-        public void next() {
-            String nextId = pollNextFromQueue();
+        void next() {
+            String nextId = pollQueue();
             if (nextId != null) {
                 startSong(nextId);
                 state.play(this);
@@ -437,9 +553,9 @@ public class SpotifyLLD {
             int size = contextSongIds.size();
             if (size == 0 || contextIndex < 0) return;
 
-            int candidate = orderStrategy.nextIndex(contextIndex, size, rnd);
+            int candidate = order.nextIndex(contextIndex, size, rnd);
 
-            if (orderStrategy instanceof NormalOrder) {
+            if (order instanceof NormalOrder) {
                 if (candidate >= size) {
                     if (repeatMode == RepeatMode.ALL) candidate = 0;
                     else { stop(); return; }
@@ -453,7 +569,7 @@ public class SpotifyLLD {
             state.play(this);
         }
 
-        public void previous() {
+        void previous() {
             if (currentSongId == null) return;
 
             if (positionSec > 3) { seek(0); return; }
@@ -467,9 +583,9 @@ public class SpotifyLLD {
             int size = contextSongIds.size();
             if (size == 0 || contextIndex < 0) return;
 
-            int candidate = orderStrategy.prevIndex(contextIndex, size, rnd);
+            int candidate = order.prevIndex(contextIndex, size, rnd);
 
-            if (orderStrategy instanceof NormalOrder) {
+            if (order instanceof NormalOrder) {
                 if (candidate < 0) {
                     if (repeatMode == RepeatMode.ALL) candidate = size - 1;
                     else { seek(0); return; }
@@ -483,7 +599,8 @@ public class SpotifyLLD {
             state.play(this);
         }
 
-        private String pollNextFromQueue() {
+        // --- internals ---
+        private String pollQueue() {
             if (!playNext.isEmpty()) return playNext.pollFirst();
             if (!upNext.isEmpty()) return upNext.pollFirst();
             return null;
@@ -500,7 +617,6 @@ public class SpotifyLLD {
         }
     }
 
-    // ---------- Playback Service ----------
     static final class PlaybackService {
         private final Catalog catalog;
         private final LibraryService library;
@@ -511,23 +627,39 @@ public class SpotifyLLD {
             this.library = library;
         }
 
-        public PlaybackSession session(String userId) {
+        PlaybackSession session(String userId) {
             return sessions.computeIfAbsent(userId, id -> new PlaybackSession(id, catalog, library));
         }
     }
 
-    // ---------- Facade ----------
+    // -------------------- Facade (Spotify APIs) --------------------
     static final class SpotifyApp {
         private final Catalog catalog;
         private final LibraryService library;
         private final PlaylistService playlists;
         private final PlaybackService playback;
+        private final SubscriptionService subscriptions;
 
         SpotifyApp(Catalog catalog) {
             this.catalog = catalog;
             this.library = new LibraryService(20);
             this.playlists = new PlaylistService();
             this.playback = new PlaybackService(catalog, library);
+            this.subscriptions = new SubscriptionService(new DefaultPricingStrategy(), new DummyPaymentService());
+        }
+
+        // ---- Subscription APIs ----
+        public Subscription subscribeMonthly(String userId, SubscriptionPlan plan) {
+            return subscriptions.subscribeMonthly(userId, plan);
+        }
+
+        public Subscription getSubscription(String userId) { return subscriptions.getSubscription(userId); }
+        public List<Charge> getCharges(String userId) { return subscriptions.getCharges(userId); }
+
+        private void ensureSubscribed(String userId) {
+            if (!subscriptions.hasActiveSubscription(userId)) {
+                throw new IllegalStateException("User has no active subscription");
+            }
         }
 
         // ---- Playlist APIs ----
@@ -539,25 +671,30 @@ public class SpotifyLLD {
             playlists.addSong(playlistId, userId, songId);
         }
 
+        // ---- Playback entry points (subscription required) ----
+        public void playSong(String userId, String songId) {
+            ensureSubscribed(userId);
+            playback.session(userId).playSong(songId);
+        }
+
         public void playPlaylist(String userId, String playlistId) {
+            ensureSubscribed(userId);
             Playlist p = playlists.get(playlistId);
             if (p == null) return;
             playback.session(userId).playContext(p.songIdsView(), 0);
         }
 
-        // ---- Play Album / Artist ----
         public void playAlbum(String userId, String albumId) {
-            List<String> songs = catalog.songsOfAlbum(albumId);
-            playback.session(userId).playContext(songs, 0);
+            ensureSubscribed(userId);
+            playback.session(userId).playContext(catalog.songsOfAlbum(albumId), 0);
         }
 
         public void playArtist(String userId, String artistId) {
-            List<String> songs = catalog.songsOfArtist(artistId);
-            playback.session(userId).playContext(songs, 0);
+            ensureSubscribed(userId);
+            playback.session(userId).playContext(catalog.songsOfArtist(artistId), 0);
         }
 
-        // ---- Playback APIs ----
-        public void playSong(String userId, String songId) { playback.session(userId).playSong(songId); }
+        // ---- Playback controls (no need to re-check subscription) ----
         public void pause(String userId) { playback.session(userId).pause(); }
         public void resume(String userId) { playback.session(userId).resume(); }
         public void next(String userId) { playback.session(userId).next(); }
@@ -565,8 +702,19 @@ public class SpotifyLLD {
         public void seek(String userId, int sec) { playback.session(userId).seek(sec); }
         public void setShuffle(String userId, boolean enabled) { playback.session(userId).setShuffle(enabled); }
         public void setRepeat(String userId, RepeatMode mode) { playback.session(userId).setRepeatMode(mode); }
-        public void queueNext(String userId, String songId) { playback.session(userId).addToQueueNext(songId); }
-        public void queueEnd(String userId, String songId) { playback.session(userId).addToQueueEnd(songId); }
+
+        // Queue (considered part of listening -> keep it guarded)
+        public void queueNext(String userId, String songId) {
+            ensureSubscribed(userId);
+            playback.session(userId).addToQueueNext(songId);
+        }
+
+        public void queueEnd(String userId, String songId) {
+            ensureSubscribed(userId);
+            playback.session(userId).addToQueueEnd(songId);
+        }
+
+        public List<String> viewUpNext(String userId) { return playback.session(userId).viewUpNext(); }
 
         // ---- Library APIs ----
         public void like(String userId, String songId) { library.like(userId, songId); }
@@ -575,28 +723,26 @@ public class SpotifyLLD {
         public List<String> recent(String userId) { return library.recentlyPlayed(userId); }
 
         // ---- Search APIs ----
-        public List<Song> searchSongs(String prefix) { return catalog.searchSongByTitlePrefix(prefix); }
-        public List<Artist> searchArtists(String prefix) { return catalog.searchArtistByNamePrefix(prefix); }
-        public List<Album> searchAlbums(String prefix) { return catalog.searchAlbumByNamePrefix(prefix); }
+        public List<Song> searchSongs(String prefix) { return catalog.searchSongTitlePrefix(prefix); }
+        public List<Artist> searchArtists(String prefix) { return catalog.searchArtistNamePrefix(prefix); }
+        public List<Album> searchAlbums(String prefix) { return catalog.searchAlbumNamePrefix(prefix); }
 
+        // ---- Listener hook ----
         public void addPlaybackListener(String userId, PlaybackListener l) {
             playback.session(userId).addListener(l);
         }
     }
 
-    // ---------- Example Usage (Optional) ----------
+    // -------------------- Demo (optional) --------------------
     public static void main(String[] args) {
         InMemoryCatalog catalog = new InMemoryCatalog();
 
-        // Artists
         catalog.addArtist(new Artist("a1", "Imagine Dragons"));
         catalog.addArtist(new Artist("a2", "Queen"));
 
-        // Albums
         catalog.addAlbum(new Album("al1", "Evolve", List.of("a1")));
         catalog.addAlbum(new Album("al2", "A Night at the Opera", List.of("a2")));
 
-        // Songs
         catalog.addSong(new Song("s1", "Believer", 204, "al1", List.of("a1")));
         catalog.addSong(new Song("s2", "Thunder", 187, "al1", List.of("a1")));
         catalog.addSong(new Song("s3", "Bohemian Rhapsody", 355, "al2", List.of("a2")));
@@ -605,21 +751,23 @@ public class SpotifyLLD {
         String userId = "u1";
 
         app.addPlaybackListener(userId, new PlaybackListener() {
-            public void onNowPlaying(String u, Song s) { System.out.println("Now playing: " + s); }
+            public void onNowPlaying(String u, Song s) { System.out.println("NowPlaying: " + s); }
             public void onStateChanged(String u, String st) { System.out.println("State: " + st); }
             public void onPositionChanged(String u, int pos) { /* ignore */ }
         });
 
-        // Play Album
+        // Must subscribe before listening
+        app.subscribeMonthly(userId, SubscriptionPlan.PREMIUM);
+        System.out.println("Charges: " + app.getCharges(userId));
+
         app.playAlbum(userId, "al1");
         app.setShuffle(userId, true);
         app.setRepeat(userId, RepeatMode.ALL);
         app.next(userId);
 
-        // Play Artist
-        app.playArtist(userId, "a2");
+        app.queueNext(userId, "s3");
+        app.next(userId);
 
-        // Like + Recents
         app.like(userId, "s3");
         System.out.println("Liked: " + app.likedSongs(userId));
         System.out.println("Recent: " + app.recent(userId));

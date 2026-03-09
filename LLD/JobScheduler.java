@@ -1,21 +1,21 @@
 // Keep enum if you want it for readability / logging
-enum TaskSchedulerType {
+enum JobSchedulerType {
     ONE_TIME,
     PERIOD_WITH_FIXED_RATE,
     PERIOD_WITH_FIXED_DELAY
 }
 
-// ---- Task Model (Template Method style) ----
-abstract class ScheduledTask {
+// ---- Job Model (Template Method style) ----
+abstract class ScheduledJob {
     private final String id;
     private final Runnable runnable;
     private final TimeUnit unit;
-    private final TaskSchedulerType type;
+    private final JobSchedulerType type;
 
     // mutable but only touched under scheduler lock
     private long scheduledTimeMillis;
 
-    protected ScheduledTask(String id, Runnable runnable, long scheduledTimeMillis, TimeUnit unit, TaskSchedulerType type) {
+    protected ScheduledJob(String id, Runnable runnable, long scheduledTimeMillis, TimeUnit unit, JobSchedulerType type) {
         this.id = id;
         this.runnable = runnable;
         this.scheduledTimeMillis = scheduledTimeMillis;
@@ -26,7 +26,7 @@ abstract class ScheduledTask {
     public String getId() { return id; }
     public Runnable getRunnable() { return runnable; }
     public TimeUnit getUnit() { return unit; }
-    public TaskSchedulerType getType() { return type; }
+    public JobSchedulerType getType() { return type; }
 
     public long getScheduledTimeMillis() { return scheduledTimeMillis; }
     public void setScheduledTimeMillis(long scheduledTimeMillis) { this.scheduledTimeMillis = scheduledTimeMillis; }
@@ -38,10 +38,10 @@ abstract class ScheduledTask {
     public abstract OptionalLong nextScheduleTimeAfterRun(long nowMillis);
 }
 
-// One-time task
-final class OneTimeTask extends ScheduledTask {
-    public OneTimeTask(String id, Runnable runnable, long scheduledTimeMillis, TimeUnit unit) {
-        super(id, runnable, scheduledTimeMillis, unit, TaskSchedulerType.ONE_TIME);
+// One-time Job
+final class OneTimeJob extends ScheduledJob {
+    public OneTimeJob(String id, Runnable runnable, long scheduledTimeMillis, TimeUnit unit) {
+        super(id, runnable, scheduledTimeMillis, unit, JobSchedulerType.ONE_TIME);
     }
 
     @Override
@@ -51,10 +51,10 @@ final class OneTimeTask extends ScheduledTask {
 }
 
 // Fixed rate periodic
-final class FixedRateTask extends ScheduledTask {
+final class FixedRateJob extends ScheduledJob {
     private final long period;
-    public FixedRateTask(String id, Runnable runnable, long scheduledTimeMillis, TimeUnit unit, long period) {
-        super(id, runnable, scheduledTimeMillis, unit, TaskSchedulerType.PERIOD_WITH_FIXED_RATE);
+    public FixedRateJob(String id, Runnable runnable, long scheduledTimeMillis, TimeUnit unit, long period) {
+        super(id, runnable, scheduledTimeMillis, unit, JobSchedulerType.PERIOD_WITH_FIXED_RATE);
         this.period = period;
     }
     @Override
@@ -65,10 +65,10 @@ final class FixedRateTask extends ScheduledTask {
 }
 
 // Fixed delay periodic
-final class FixedDelayTask extends ScheduledTask {
+final class FixedDelayJob extends ScheduledJob {
     private final long delay;
-    public FixedDelayTask(String id, Runnable runnable, long scheduledTimeMillis, TimeUnit unit, long delay) {
-        super(id, runnable, scheduledTimeMillis, unit, TaskSchedulerType.PERIOD_WITH_FIXED_DELAY);
+    public FixedDelayJob(String id, Runnable runnable, long scheduledTimeMillis, TimeUnit unit, long delay) {
+        super(id, runnable, scheduledTimeMillis, unit, JobSchedulerType.PERIOD_WITH_FIXED_DELAY);
         this.delay = delay;
     }
     @Override
@@ -79,7 +79,7 @@ final class FixedDelayTask extends ScheduledTask {
 }
 
 // ---- Service API ----
-interface TaskSchedulerService {
+interface JobSchedulerService {
     void schedule(Runnable command, long delay, TimeUnit unit);
     void scheduleAtFixedRate(Runnable command, long initialDelay, long period, TimeUnit unit);
     void scheduleWithFixedDelay(Runnable command, long initialDelay, long delay, TimeUnit unit);
@@ -89,12 +89,12 @@ interface TaskSchedulerService {
 }
 
 // ---- Implementation ----
-final class TaskSchedulerServiceImpl implements TaskSchedulerService, AutoCloseable {
+final class JobSchedulerServiceImpl implements JobSchedulerService, AutoCloseable {
 
     private static final int MAX_THREAD_POOL = 10;
 
-    private final PriorityQueue<ScheduledTask> taskQueue =
-            new PriorityQueue<>(Comparator.comparingLong(ScheduledTask::getScheduledTimeMillis));
+    private final PriorityQueue<ScheduledJob> JobQueue =
+            new PriorityQueue<>(Comparator.comparingLong(ScheduledJob::getScheduledTimeMillis));
 
     private final ThreadPoolExecutor executor =
             (ThreadPoolExecutor) Executors.newFixedThreadPool(MAX_THREAD_POOL);
@@ -110,27 +110,27 @@ final class TaskSchedulerServiceImpl implements TaskSchedulerService, AutoClosea
         if (running) return;
         running = true;
 
-        schedulerThread = new Thread(this::runLoop, "task-scheduler-thread");
+        schedulerThread = new Thread(this::runLoop, "Job-scheduler-thread");
         schedulerThread.setDaemon(true);
         schedulerThread.start();
     }
 
     private void runLoop() {
         while (running) {
-            ScheduledTask taskToRun = null;
+            ScheduledJob JobToRun = null;
 
             lock.lock();
             try {
-                while (running && taskQueue.isEmpty()) {
+                while (running && JobQueue.isEmpty()) {
                     notEmptyOrUpdated.await();
                 }
                 if (!running) break;
 
-                while (running && !taskQueue.isEmpty()) {
+                while (running && !JobQueue.isEmpty()) {
                     long now = System.currentTimeMillis();
-                    long sleepMs = taskQueue.peek().getScheduledTimeMillis() - now;
+                    long sleepMs = JobQueue.peek().getScheduledTimeMillis() - now;
                     if (sleepMs <= 0) {
-                        taskToRun = taskQueue.poll();
+                        JobToRun = JobQueue.poll();
                         break;
                     }
                     notEmptyOrUpdated.await(sleepMs, TimeUnit.MILLISECONDS);
@@ -142,36 +142,36 @@ final class TaskSchedulerServiceImpl implements TaskSchedulerService, AutoClosea
                 lock.unlock();
             }
 
-            if (!running || taskToRun == null) {
+            if (!running || JobToRun == null) {
                 continue;
             }
 
             // Execute OUTSIDE the lock (critical fix)
             try {
-                if (taskToRun.getType() == TaskSchedulerType.PERIOD_WITH_FIXED_DELAY) {
-                    Future<?> f = executor.submit(taskToRun.getRunnable());
+                if (JobToRun.getType() == JobSchedulerType.PERIOD_WITH_FIXED_DELAY) {
+                    Future<?> f = executor.submit(JobToRun.getRunnable());
                     f.get(); // wait for completion for fixed-delay
                 } else {
-                    executor.submit(taskToRun.getRunnable());
+                    executor.submit(JobToRun.getRunnable());
                 }
             } catch (InterruptedException ie) {
                 Thread.currentThread().interrupt();
                 break;
             } catch (ExecutionException ee) {
                 // swallow or log; do not kill scheduler
-                System.out.println("Error executing task " + taskToRun.getId() + " : " + ee.getMessage());
+                System.out.println("Error executing Job " + JobToRun.getId() + " : " + ee.getMessage());
             } catch (Exception ex) {
-                System.out.println("Error executing task " + taskToRun.getId() + " : " + ex.getMessage());
+                System.out.println("Error executing Job " + JobToRun.getId() + " : " + ex.getMessage());
             }
 
             // Reschedule if periodic
             long nowAfterRun = System.currentTimeMillis();
-            OptionalLong next = taskToRun.nextScheduleTimeAfterRun(nowAfterRun);
+            OptionalLong next = JobToRun.nextScheduleTimeAfterRun(nowAfterRun);
             if (next.isPresent() && running) {
-                taskToRun.setScheduledTimeMillis(next.getAsLong());
+                JobToRun.setScheduledTimeMillis(next.getAsLong());
                 lock.lock();
                 try {
-                    taskQueue.add(taskToRun);
+                    JobQueue.add(JobToRun);
                     notEmptyOrUpdated.signalAll();
                 } finally {
                     lock.unlock();
@@ -183,11 +183,11 @@ final class TaskSchedulerServiceImpl implements TaskSchedulerService, AutoClosea
     @Override
     public void schedule(Runnable command, long delay, TimeUnit unit) {
         long scheduledTime = System.currentTimeMillis() + unit.toMillis(delay);
-        ScheduledTask task = new OneTimeTask(UUID.randomUUID().toString(), command, scheduledTime, unit);
+        ScheduledJob Job = new OneTimeJob(UUID.randomUUID().toString(), command, scheduledTime, unit);
 
         lock.lock();
         try {
-            taskQueue.add(task);
+            JobQueue.add(Job);
             notEmptyOrUpdated.signalAll();
         } finally {
             lock.unlock();
@@ -197,11 +197,11 @@ final class TaskSchedulerServiceImpl implements TaskSchedulerService, AutoClosea
     @Override
     public void scheduleAtFixedRate(Runnable command, long initialDelay, long period, TimeUnit unit) {
         long scheduledTime = System.currentTimeMillis() + unit.toMillis(initialDelay);
-        ScheduledTask task = new FixedRateTask(UUID.randomUUID().toString(), command, scheduledTime, unit, period);
+        ScheduledJob Job = new FixedRateJob(UUID.randomUUID().toString(), command, scheduledTime, unit, period);
 
         lock.lock();
         try {
-            taskQueue.add(task);
+            JobQueue.add(Job);
             notEmptyOrUpdated.signalAll();
         } finally {
             lock.unlock();
@@ -211,11 +211,11 @@ final class TaskSchedulerServiceImpl implements TaskSchedulerService, AutoClosea
     @Override
     public void scheduleWithFixedDelay(Runnable command, long initialDelay, long delay, TimeUnit unit) {
         long scheduledTime = System.currentTimeMillis() + unit.toMillis(initialDelay);
-        ScheduledTask task = new FixedDelayTask(UUID.randomUUID().toString(), command, scheduledTime, unit, delay);
+        ScheduledJob Job = new FixedDelayJob(UUID.randomUUID().toString(), command, scheduledTime, unit, delay);
 
         lock.lock();
         try {
-            taskQueue.add(task);
+            JobQueue.add(Job);
             notEmptyOrUpdated.signalAll();
         } finally {
             lock.unlock();
@@ -248,15 +248,15 @@ final class TaskSchedulerServiceImpl implements TaskSchedulerService, AutoClosea
 // ---- Demo ----
 public class Main {
     public static void main(String[] args) {
-        TaskSchedulerService scheduler = new TaskSchedulerServiceImpl();
+        JobSchedulerService scheduler = new JobSchedulerServiceImpl();
         scheduler.start();
 
-        scheduler.schedule(task("ONE_TIME"), 1, TimeUnit.SECONDS);
-        scheduler.scheduleAtFixedRate(task("FIXED_RATE"), 1, 2, TimeUnit.SECONDS);
-        scheduler.scheduleWithFixedDelay(task("FIXED_DELAY"), 1, 2, TimeUnit.SECONDS);
+        scheduler.schedule(Job("ONE_TIME"), 1, TimeUnit.SECONDS);
+        scheduler.scheduleAtFixedRate(Job("FIXED_RATE"), 1, 2, TimeUnit.SECONDS);
+        scheduler.scheduleWithFixedDelay(Job("FIXED_DELAY"), 1, 2, TimeUnit.SECONDS);
     }
 
-    private static Runnable task(String name) {
+    private static Runnable Job(String name) {
         return () -> {
             System.out.println(name + " started at " + System.currentTimeMillis() / 1000);
             try { Thread.sleep(1000); } catch (InterruptedException e) { Thread.currentThread().interrupt(); }

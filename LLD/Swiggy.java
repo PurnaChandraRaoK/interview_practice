@@ -4,13 +4,14 @@ import java.util.*;
 import java.util.concurrent.atomic.AtomicInteger;
 
 /*
- * Food Ordering System (Interview-ready LLD)
- * - Clean layering: Models + Repos + Services + Strategies + Factories
- * - Patterns used:
- *   1) Strategy: driver assignment, restaurant sorting
- *   2) State: order lifecycle
- *   3) Factory: payment method, notification channel
- * - In-memory repositories (easy to swap later)
+ * Swiggy-like Food Ordering System (Interview-ready LLD)
+ * Added: Bill, Payment record, Delivery entity, DeliveryChargeStrategy, Coupon system, Order history (best way)
+ *
+ * Patterns:
+ * - Strategy: driver assignment, restaurant sorting, delivery charge
+ * - State: order lifecycle
+ * - Factory: payment method, notification channel, delivery charge strategy
+ * - Singleton: Coupon instances (Bank10Coupon)
  */
 
 // =========================
@@ -51,7 +52,7 @@ final class Address {
 }
 
 // =========================
-// Models (People)
+// People
 // =========================
 abstract class Person {
     private final String id;
@@ -75,6 +76,9 @@ abstract class Person {
         this.location = Objects.requireNonNull(newLocation);
     }
 }
+
+enum PaymentMode { CASH, CARD, UPI }
+enum PaymentStatus { SUCCESS, FAILED }
 
 final class Account {
     private PaymentMode preferredPaymentMode;
@@ -111,7 +115,7 @@ final class User extends Person {
 
 final class Driver extends Person {
     private boolean available = true;
-    private String currentOrderId; // minimal linkage
+    private String currentOrderId;
 
     public Driver(String id, String name, String phone, Location location) {
         super(id, name, phone, location);
@@ -132,7 +136,7 @@ final class Driver extends Person {
 }
 
 // =========================
-// Models (Restaurant, Menu, Rating)
+// Restaurant, Menu, Rating
 // =========================
 final class MenuItem {
     private final String id;
@@ -186,11 +190,8 @@ final class Restaurant {
     private final String name;
     private final Address address;
     private final Set<String> servicePincodes = new HashSet<>();
-
-    // menuId -> MenuItem
     private final Map<String, MenuItem> menu = new LinkedHashMap<>();
 
-    // Capacity model (simple): how many item-quantities can be in-flight at a time
     private final int totalCapacity;
     private int capacityInUse;
 
@@ -210,13 +211,9 @@ final class Restaurant {
     public double getAverageRating() { return ratingAggregate.average(); }
     public Map<String, MenuItem> getMenu() { return Collections.unmodifiableMap(menu); }
 
-    public void upsertMenuItem(MenuItem item) {
-        menu.put(item.getId(), item);
-    }
+    public void upsertMenuItem(MenuItem item) { menu.put(item.getId(), item); }
 
-    public boolean serves(String pincode) {
-        return pincode != null && servicePincodes.contains(pincode);
-    }
+    public boolean serves(String pincode) { return pincode != null && servicePincodes.contains(pincode); }
 
     public boolean canFulfill(List<OrderLine> lines) {
         int neededQty = 0;
@@ -227,9 +224,7 @@ final class Restaurant {
         return (capacityInUse + neededQty) <= totalCapacity;
     }
 
-    public void allocateCapacity(List<OrderLine> lines) {
-        capacityInUse += totalQuantity(lines);
-    }
+    public void allocateCapacity(List<OrderLine> lines) { capacityInUse += totalQuantity(lines); }
 
     public void releaseCapacity(List<OrderLine> lines) {
         capacityInUse -= totalQuantity(lines);
@@ -245,9 +240,7 @@ final class Restaurant {
         return sum;
     }
 
-    public void addReview(Review review) {
-        ratingAggregate.add(review.getRating());
-    }
+    public void addReview(Review review) { ratingAggregate.add(review.getRating()); }
 
     private int totalQuantity(List<OrderLine> lines) {
         int qty = 0;
@@ -257,7 +250,7 @@ final class Restaurant {
 }
 
 // =========================
-// Models (Cart, Order)
+// Cart, Order
 // =========================
 final class OrderLine {
     private final String menuItemId;
@@ -275,20 +268,16 @@ final class OrderLine {
 
 final class Cart {
     private final String userId;
-    private String restaurantId; // cart is tied to one restaurant
-    private final Map<String, Integer> items = new LinkedHashMap<>(); // menuItemId -> qty
+    private String restaurantId;
+    private final Map<String, Integer> items = new LinkedHashMap<>();
 
-    public Cart(String userId) {
-        this.userId = Objects.requireNonNull(userId);
-    }
+    public Cart(String userId) { this.userId = Objects.requireNonNull(userId); }
 
     public String getUserId() { return userId; }
     public String getRestaurantId() { return restaurantId; }
 
     public void selectRestaurant(String restaurantId) {
-        if (this.restaurantId != null && !this.restaurantId.equals(restaurantId)) {
-            items.clear(); // simple: switching restaurant clears cart
-        }
+        if (this.restaurantId != null && !this.restaurantId.equals(restaurantId)) items.clear();
         this.restaurantId = Objects.requireNonNull(restaurantId);
     }
 
@@ -298,23 +287,16 @@ final class Cart {
         items.put(menuItemId, items.getOrDefault(menuItemId, 0) + qty);
     }
 
-    public void removeItem(String menuItemId) {
-        items.remove(menuItemId);
-    }
+    public void removeItem(String menuItemId) { items.remove(menuItemId); }
 
     public List<OrderLine> toOrderLines() {
         List<OrderLine> lines = new ArrayList<>();
-        for (Map.Entry<String, Integer> e : items.entrySet()) {
-            lines.add(new OrderLine(e.getKey(), e.getValue()));
-        }
+        for (Map.Entry<String, Integer> e : items.entrySet()) lines.add(new OrderLine(e.getKey(), e.getValue()));
         return lines;
     }
 
     public boolean isEmpty() { return items.isEmpty(); }
 }
-
-enum PaymentMode { CASH, CARD, UPI }
-enum PaymentStatus { SUCCESS, FAILED }
 
 interface OrderState {
     OrderState next();
@@ -325,17 +307,14 @@ final class CreatedState implements OrderState {
     public OrderState next() { return new AcceptedState(); }
     public String name() { return "CREATED"; }
 }
-
 final class AcceptedState implements OrderState {
     public OrderState next() { return new PickedUpState(); }
     public String name() { return "ACCEPTED"; }
 }
-
 final class PickedUpState implements OrderState {
     public OrderState next() { return new DeliveredState(); }
     public String name() { return "PICKED_UP"; }
 }
-
 final class DeliveredState implements OrderState {
     public OrderState next() { return this; }
     public String name() { return "DELIVERED"; }
@@ -350,21 +329,26 @@ final class Order {
     private final Address deliveryAddress;
     private final List<OrderLine> lines;
 
-    private final BigDecimal amount;
+    private final BigDecimal itemTotal;
+    private BigDecimal payableAmount; // after tax/discount/delivery
     private PaymentStatus paymentStatus;
 
     private OrderState state = new CreatedState();
     private String driverId;
 
+    // Links
+    private String billId;
+    private String deliveryId;
+
     private final LocalDateTime createdAt = LocalDateTime.now();
 
-    public Order(String userId, String restaurantId, Address deliveryAddress, List<OrderLine> lines, BigDecimal amount) {
+    public Order(String userId, String restaurantId, Address deliveryAddress, List<OrderLine> lines, BigDecimal itemTotal) {
         this.id = String.valueOf(COUNTER.incrementAndGet());
         this.userId = Objects.requireNonNull(userId);
         this.restaurantId = Objects.requireNonNull(restaurantId);
         this.deliveryAddress = Objects.requireNonNull(deliveryAddress);
         this.lines = Collections.unmodifiableList(new ArrayList<>(lines));
-        this.amount = Objects.requireNonNull(amount);
+        this.itemTotal = Objects.requireNonNull(itemTotal);
     }
 
     public String getId() { return id; }
@@ -372,18 +356,26 @@ final class Order {
     public String getRestaurantId() { return restaurantId; }
     public Address getDeliveryAddress() { return deliveryAddress; }
     public List<OrderLine> getLines() { return lines; }
-    public BigDecimal getAmount() { return amount; }
+    public BigDecimal getItemTotal() { return itemTotal; }
+
+    public BigDecimal getPayableAmount() { return payableAmount; }
+    public void setPayableAmount(BigDecimal payableAmount) { this.payableAmount = payableAmount; }
+
     public String getStatus() { return state.name(); }
     public PaymentStatus getPaymentStatus() { return paymentStatus; }
     public String getDriverId() { return driverId; }
 
+    public String getBillId() { return billId; }
+    public String getDeliveryId() { return deliveryId; }
+    public void setBillId(String billId) { this.billId = billId; }
+    public void setDeliveryId(String deliveryId) { this.deliveryId = deliveryId; }
+
     public void markPayment(PaymentStatus status) { this.paymentStatus = status; }
-
     public void assignDriver(String driverId) { this.driverId = driverId; }
-
     public void advance() { this.state = state.next(); }
 
     public boolean isDelivered() { return "DELIVERED".equals(state.name()); }
+    public LocalDateTime getCreatedAt() { return createdAt; }
 
     @Override
     public String toString() {
@@ -391,17 +383,226 @@ final class Order {
                 "id='" + id + '\'' +
                 ", userId='" + userId + '\'' +
                 ", restaurantId='" + restaurantId + '\'' +
-                ", amount=" + amount +
+                ", itemTotal=" + itemTotal +
+                ", payable=" + payableAmount +
                 ", paymentStatus=" + paymentStatus +
                 ", status=" + state.name() +
                 ", driverId=" + driverId +
+                ", billId=" + billId +
+                ", deliveryId=" + deliveryId +
                 ", createdAt=" + createdAt +
                 '}';
     }
 }
 
 // =========================
-// Repositories (Interfaces)
+// Billing + Payment + Delivery (NEW)
+// =========================
+final class Bill {
+    private static final AtomicInteger COUNTER = new AtomicInteger(0);
+
+    private final String billId;
+    private final String orderId;
+
+    private final BigDecimal itemTotal;
+    private final BigDecimal tax;
+    private final BigDecimal discount;
+    private final BigDecimal deliveryFee;
+    private final BigDecimal totalAmountToBePaid;
+
+    private final LocalDateTime createdAt;
+
+    public Bill(String orderId, BigDecimal itemTotal, BigDecimal tax, BigDecimal discount, BigDecimal deliveryFee) {
+        this.billId = "B" + COUNTER.incrementAndGet();
+        this.orderId = Objects.requireNonNull(orderId);
+
+        this.itemTotal = nz(itemTotal);
+        this.tax = nz(tax);
+        this.discount = nz(discount);
+        this.deliveryFee = nz(deliveryFee);
+
+        this.totalAmountToBePaid = this.itemTotal.add(this.tax).add(this.deliveryFee).subtract(this.discount);
+        this.createdAt = LocalDateTime.now();
+    }
+
+    private BigDecimal nz(BigDecimal v) { return v == null ? BigDecimal.ZERO : v; }
+
+    public String getBillId() { return billId; }
+    public String getOrderId() { return orderId; }
+    public BigDecimal getTotalAmountToBePaid() { return totalAmountToBePaid; }
+    public BigDecimal getTax() { return tax; }
+    public BigDecimal getDiscount() { return discount; }
+    public BigDecimal getDeliveryFee() { return deliveryFee; }
+
+    @Override
+    public String toString() {
+        return "Bill{" +
+                "billId='" + billId + '\'' +
+                ", orderId='" + orderId + '\'' +
+                ", itemTotal=" + itemTotal +
+                ", tax=" + tax +
+                ", discount=" + discount +
+                ", deliveryFee=" + deliveryFee +
+                ", payable=" + totalAmountToBePaid +
+                ", createdAt=" + createdAt +
+                '}';
+    }
+}
+
+final class Payment {
+    private static final AtomicInteger COUNTER = new AtomicInteger(0);
+
+    private final String id;
+    private final String billId;
+    private final BigDecimal amount;
+    private final LocalDateTime date;
+    private final PaymentStatus status;
+    private final PaymentMode mode;
+    private final String couponCode;
+
+    public Payment(String billId, BigDecimal amount, PaymentStatus status, PaymentMode mode, String couponCode) {
+        this.id = "P" + COUNTER.incrementAndGet();
+        this.billId = Objects.requireNonNull(billId);
+        this.amount = Objects.requireNonNull(amount);
+        this.status = Objects.requireNonNull(status);
+        this.mode = Objects.requireNonNull(mode);
+        this.couponCode = couponCode;
+        this.date = LocalDateTime.now();
+    }
+
+    public String getId() { return id; }
+    public String getBillId() { return billId; }
+    public PaymentStatus getStatus() { return status; }
+
+    @Override
+    public String toString() {
+        return "Payment{" +
+                "id='" + id + '\'' +
+                ", billId='" + billId + '\'' +
+                ", amount=" + amount +
+                ", date=" + date +
+                ", status=" + status +
+                ", mode=" + mode +
+                ", couponCode='" + couponCode + '\'' +
+                '}';
+    }
+}
+
+enum DeliveryStatus { CREATED, ASSIGNED, PICKED_UP, DELIVERED, CANCELLED }
+
+final class Delivery {
+    private static final AtomicInteger COUNTER = new AtomicInteger(0);
+
+    private final String id;
+    private final String orderId;
+    private LocalDateTime startDateTime;
+    private LocalDateTime endDateTime;
+    private String deliveryBoyId;
+
+    private final String customerNumber;
+    private final Address customerAddress;
+    private DeliveryStatus status = DeliveryStatus.CREATED;
+
+    public Delivery(String orderId, String customerNumber, Address customerAddress) {
+        this.id = "DEL" + COUNTER.incrementAndGet();
+        this.orderId = Objects.requireNonNull(orderId);
+        this.customerNumber = Objects.requireNonNull(customerNumber);
+        this.customerAddress = Objects.requireNonNull(customerAddress);
+    }
+
+    public String getId() { return id; }
+    public String getOrderId() { return orderId; }
+    public DeliveryStatus getStatus() { return status; }
+
+    public void assignDriver(String driverId) {
+        this.deliveryBoyId = driverId;
+        this.status = DeliveryStatus.ASSIGNED;
+    }
+
+    public void markPickedUp() {
+        this.startDateTime = LocalDateTime.now();
+        this.status = DeliveryStatus.PICKED_UP;
+    }
+
+    public void markDelivered() {
+        this.endDateTime = LocalDateTime.now();
+        this.status = DeliveryStatus.DELIVERED;
+    }
+
+    @Override
+    public String toString() {
+        return "Delivery{" +
+                "id='" + id + '\'' +
+                ", orderId='" + orderId + '\'' +
+                ", startDateTime=" + startDateTime +
+                ", endDateTime=" + endDateTime +
+                ", deliveryBoyId='" + deliveryBoyId + '\'' +
+                ", status=" + status +
+                '}';
+    }
+}
+
+// =========================
+// Coupon System (NEW integration)
+// =========================
+enum CouponType { PERCENTAGE, FLAT }
+
+interface Coupon {
+    String code();
+    boolean isEligible(User user, BigDecimal itemTotal);
+    BigDecimal discountAmount(BigDecimal itemTotal);
+    String getDescription();
+}
+
+final class Bank10Coupon implements Coupon {
+    private static final Bank10Coupon INSTANCE =
+            new Bank10Coupon("BANK10", "10% discount on BANK debit card", new BigDecimal("0.10"));
+
+    private final String code;
+    private final String description;
+    private final BigDecimal pct;
+
+    private Bank10Coupon(String code, String description, BigDecimal pct) {
+        this.code = code;
+        this.description = description;
+        this.pct = pct;
+    }
+
+    public static Bank10Coupon getInstance() { return INSTANCE; }
+
+    public String code() { return code; }
+
+    public boolean isEligible(User user, BigDecimal itemTotal) {
+        // Keep simple: min item total condition
+        return itemTotal.compareTo(new BigDecimal("100.00")) >= 0;
+    }
+
+    public BigDecimal discountAmount(BigDecimal itemTotal) {
+        return itemTotal.multiply(pct);
+    }
+
+    public String getDescription() { return description; }
+}
+
+final class CouponManager {
+    private final Map<String, Coupon> couponsByCode = new HashMap<>();
+
+    public CouponManager() {
+        add(Bank10Coupon.getInstance());
+    }
+
+    public void add(Coupon c) { couponsByCode.put(c.code().toUpperCase(), c); }
+
+    public Optional<Coupon> find(String code) {
+        if (code == null || code.trim().isEmpty()) return Optional.empty();
+        return Optional.ofNullable(couponsByCode.get(code.trim().toUpperCase()));
+    }
+
+    public Collection<Coupon> getAll() { return Collections.unmodifiableCollection(couponsByCode.values()); }
+}
+
+// =========================
+// Repositories
 // =========================
 interface UserRepository {
     void save(User user);
@@ -423,11 +624,32 @@ interface DriverRepository {
 interface OrderRepository {
     void save(Order order);
     Order findById(String orderId);
+
+    // Best way: query by partition key / index userId -> orderIds
     List<Order> findByUserId(String userId);
+    List<Order> findByUserId(String userId, int limit);
+    List<Order> findByUserIdAndStatus(String userId, String status);
+}
+
+interface BillRepository {
+    void save(Bill bill);
+    Bill findById(String billId);
+    Bill findByOrderId(String orderId);
+}
+
+interface PaymentRepository {
+    void save(Payment payment);
+    List<Payment> findByBillId(String billId);
+}
+
+interface DeliveryRepository {
+    void save(Delivery delivery);
+    Delivery findById(String deliveryId);
+    Delivery findByOrderId(String orderId);
 }
 
 // =========================
-// Repositories (In-Memory)
+// In-Memory Repositories
 // =========================
 final class InMemoryUserRepository implements UserRepository {
     private final Map<String, User> map = new HashMap<>();
@@ -451,7 +673,9 @@ final class InMemoryDriverRepository implements DriverRepository {
 
 final class InMemoryOrderRepository implements OrderRepository {
     private final Map<String, Order> map = new LinkedHashMap<>();
-    private final Map<String, List<String>> userOrders = new HashMap<>(); // userId -> orderIds
+
+    // ✅ best way: secondary index
+    private final Map<String, List<String>> userOrders = new HashMap<>();
 
     public void save(Order order) {
         map.put(order.getId(), order);
@@ -465,6 +689,66 @@ final class InMemoryOrderRepository implements OrderRepository {
         List<Order> res = new ArrayList<>();
         for (String id : ids) res.add(map.get(id));
         return res;
+    }
+
+    public List<Order> findByUserId(String userId, int limit) {
+        if (limit <= 0) return Collections.emptyList();
+        List<Order> all = findByUserId(userId);
+        int from = Math.max(0, all.size() - limit);
+        return all.subList(from, all.size());
+    }
+
+    public List<Order> findByUserIdAndStatus(String userId, String status) {
+        List<Order> all = findByUserId(userId);
+        List<Order> res = new ArrayList<>();
+        for (Order o : all) if (o.getStatus().equalsIgnoreCase(status)) res.add(o);
+        return res;
+    }
+}
+
+final class InMemoryBillRepository implements BillRepository {
+    private final Map<String, Bill> byId = new HashMap<>();
+    private final Map<String, String> orderToBill = new HashMap<>();
+
+    public void save(Bill bill) {
+        byId.put(bill.getBillId(), bill);
+        orderToBill.put(bill.getOrderId(), bill.getBillId());
+    }
+
+    public Bill findById(String billId) { return byId.get(billId); }
+
+    public Bill findByOrderId(String orderId) {
+        String billId = orderToBill.get(orderId);
+        return billId == null ? null : byId.get(billId);
+    }
+}
+
+final class InMemoryPaymentRepository implements PaymentRepository {
+    private final Map<String, List<Payment>> billPayments = new HashMap<>();
+
+    public void save(Payment payment) {
+        billPayments.computeIfAbsent(payment.getBillId(), k -> new ArrayList<>()).add(payment);
+    }
+
+    public List<Payment> findByBillId(String billId) {
+        return new ArrayList<>(billPayments.getOrDefault(billId, Collections.emptyList()));
+    }
+}
+
+final class InMemoryDeliveryRepository implements DeliveryRepository {
+    private final Map<String, Delivery> byId = new HashMap<>();
+    private final Map<String, String> orderToDelivery = new HashMap<>();
+
+    public void save(Delivery delivery) {
+        byId.put(delivery.getId(), delivery);
+        orderToDelivery.put(delivery.getOrderId(), delivery.getId());
+    }
+
+    public Delivery findById(String deliveryId) { return byId.get(deliveryId); }
+
+    public Delivery findByOrderId(String orderId) {
+        String delId = orderToDelivery.get(orderId);
+        return delId == null ? null : byId.get(delId);
     }
 }
 
@@ -512,6 +796,45 @@ final class SortByNameAsc implements RestaurantSortStrategy {
 }
 
 // =========================
+// Delivery Charge Strategy (NEW)
+// =========================
+interface DeliveryChargeStrategy {
+    BigDecimal getPrice(Address from, Address to);
+}
+
+final class DefaultDeliveryChargeStrategy implements DeliveryChargeStrategy {
+    // base + perKm * distance (distance is euclidean in this demo)
+    public BigDecimal getPrice(Address from, Address to) {
+        double dist = from.getLocation().distanceTo(to.getLocation());
+        BigDecimal base = new BigDecimal("10.00");
+        BigDecimal perKm = new BigDecimal("5.00");
+        return base.add(perKm.multiply(BigDecimal.valueOf(dist)));
+    }
+}
+
+final class SurgePricingDeliveryChargeStrategy implements DeliveryChargeStrategy {
+    private final DeliveryChargeStrategy base;
+    private final BigDecimal multiplier;
+
+    public SurgePricingDeliveryChargeStrategy(DeliveryChargeStrategy base, BigDecimal multiplier) {
+        this.base = base;
+        this.multiplier = multiplier;
+    }
+
+    public BigDecimal getPrice(Address from, Address to) {
+        return base.getPrice(from, to).multiply(multiplier);
+    }
+}
+
+final class DeliveryChargeStrategyFactory {
+    public DeliveryChargeStrategy create(boolean surgeOn) {
+        DeliveryChargeStrategy base = new DefaultDeliveryChargeStrategy();
+        if (!surgeOn) return base;
+        return new SurgePricingDeliveryChargeStrategy(base, new BigDecimal("1.5"));
+    }
+}
+
+// =========================
 // Factories (Payment, Notification)
 // =========================
 interface PaymentMethod {
@@ -519,23 +842,13 @@ interface PaymentMethod {
 }
 
 final class CardPayment implements PaymentMethod {
-    public PaymentStatus pay(User user, BigDecimal amount) {
-        // Stub: simulate success
-        return PaymentStatus.SUCCESS;
-    }
+    public PaymentStatus pay(User user, BigDecimal amount) { return PaymentStatus.SUCCESS; }
 }
-
 final class UpiPayment implements PaymentMethod {
-    public PaymentStatus pay(User user, BigDecimal amount) {
-        return PaymentStatus.SUCCESS;
-    }
+    public PaymentStatus pay(User user, BigDecimal amount) { return PaymentStatus.SUCCESS; }
 }
-
 final class CashPayment implements PaymentMethod {
-    public PaymentStatus pay(User user, BigDecimal amount) {
-        // Cash on delivery -> treat as success for order placement
-        return PaymentStatus.SUCCESS;
-    }
+    public PaymentStatus pay(User user, BigDecimal amount) { return PaymentStatus.SUCCESS; }
 }
 
 final class PaymentMethodFactory {
@@ -569,21 +882,14 @@ final class NotificationFactory {
 // =========================
 final class UserService {
     private final UserRepository userRepo;
-
-    public UserService(UserRepository userRepo) {
-        this.userRepo = userRepo;
-    }
-
+    public UserService(UserRepository userRepo) { this.userRepo = userRepo; }
     public void register(User user) { userRepo.save(user); }
     public User get(String userId) { return userRepo.findById(userId); }
 }
 
 final class RestaurantService {
     private final RestaurantRepository restaurantRepo;
-
-    public RestaurantService(RestaurantRepository restaurantRepo) {
-        this.restaurantRepo = restaurantRepo;
-    }
+    public RestaurantService(RestaurantRepository restaurantRepo) { this.restaurantRepo = restaurantRepo; }
 
     public void onboard(Restaurant restaurant) { restaurantRepo.save(restaurant); }
 
@@ -596,9 +902,7 @@ final class RestaurantService {
     public List<Restaurant> searchByRestaurantName(String query, String pincode) {
         List<Restaurant> res = new ArrayList<>();
         for (Restaurant r : restaurantRepo.findAll()) {
-            if (r.serves(pincode) && r.getName().toLowerCase().contains(query.toLowerCase())) {
-                res.add(r);
-            }
+            if (r.serves(pincode) && r.getName().toLowerCase().contains(query.toLowerCase())) res.add(r);
         }
         return res;
     }
@@ -617,9 +921,7 @@ final class RestaurantService {
         return res;
     }
 
-    public List<Restaurant> sort(List<Restaurant> restaurants, RestaurantSortStrategy sorter) {
-        return sorter.sort(restaurants);
-    }
+    public List<Restaurant> sort(List<Restaurant> restaurants, RestaurantSortStrategy sorter) { return sorter.sort(restaurants); }
 
     public void addRating(String restaurantId, Review review) {
         Restaurant r = restaurantRepo.findById(restaurantId);
@@ -632,10 +934,7 @@ final class RestaurantService {
 
 final class DriverService {
     private final DriverRepository driverRepo;
-
-    public DriverService(DriverRepository driverRepo) {
-        this.driverRepo = driverRepo;
-    }
+    public DriverService(DriverRepository driverRepo) { this.driverRepo = driverRepo; }
 
     public void register(Driver driver) { driverRepo.save(driver); }
 
@@ -650,16 +949,11 @@ final class DriverService {
         for (Driver d : driverRepo.findAll()) if (d.isAvailable()) res.add(d);
         return res;
     }
-
-    public Driver get(String driverId) { return driverRepo.findById(driverId); }
 }
 
 final class PaymentService {
     private final PaymentMethodFactory factory;
-
-    public PaymentService(PaymentMethodFactory factory) {
-        this.factory = factory;
-    }
+    public PaymentService(PaymentMethodFactory factory) { this.factory = factory; }
 
     public PaymentStatus process(User user, BigDecimal amount) {
         PaymentMode preferred = user.getAccount().getPreferredPaymentMode();
@@ -669,18 +963,75 @@ final class PaymentService {
 
 final class NotificationService {
     private final NotificationFactory factory;
-    private final String defaultChannel; // keep it simple
+    private final String defaultChannel;
 
     public NotificationService(NotificationFactory factory, String defaultChannel) {
         this.factory = factory;
         this.defaultChannel = defaultChannel;
     }
 
-    public void notifyUser(User user, String msg) {
-        factory.create(defaultChannel).send(user, msg);
+    public void notifyUser(User user, String msg) { factory.create(defaultChannel).send(user, msg); }
+}
+
+// NEW: Billing / Delivery record services
+final class BillingService {
+    private final BillRepository billRepo;
+
+    public BillingService(BillRepository billRepo) { this.billRepo = billRepo; }
+
+    public Bill createBill(String orderId, BigDecimal itemTotal, BigDecimal tax, BigDecimal discount, BigDecimal deliveryFee) {
+        Bill b = new Bill(orderId, itemTotal, tax, discount, deliveryFee);
+        billRepo.save(b);
+        return b;
+    }
+
+    public Bill getBillByOrder(String orderId) { return billRepo.findByOrderId(orderId); }
+}
+
+final class PaymentRecordService {
+    private final PaymentRepository paymentRepo;
+
+    public PaymentRecordService(PaymentRepository paymentRepo) { this.paymentRepo = paymentRepo; }
+
+    public Payment record(String billId, BigDecimal amount, PaymentStatus status, PaymentMode mode, String couponCode) {
+        Payment p = new Payment(billId, amount, status, mode, couponCode);
+        paymentRepo.save(p);
+        return p;
     }
 }
 
+final class DeliveryService {
+    private final DeliveryRepository deliveryRepo;
+
+    public DeliveryService(DeliveryRepository deliveryRepo) { this.deliveryRepo = deliveryRepo; }
+
+    public Delivery createForOrder(String orderId, User user, Address addr) {
+        Delivery d = new Delivery(orderId, user.getPhoneNumber(), addr);
+        deliveryRepo.save(d);
+        return d;
+    }
+
+    public void assignDriver(String orderId, String driverId) {
+        Delivery d = deliveryRepo.findByOrderId(orderId);
+        if (d != null) d.assignDriver(driverId);
+    }
+
+    public void markPickedUp(String orderId) {
+        Delivery d = deliveryRepo.findByOrderId(orderId);
+        if (d != null) d.markPickedUp();
+    }
+
+    public void markDelivered(String orderId) {
+        Delivery d = deliveryRepo.findByOrderId(orderId);
+        if (d != null) d.markDelivered();
+    }
+
+    public Delivery track(String orderId) { return deliveryRepo.findByOrderId(orderId); }
+}
+
+// =========================
+// Order Service (extended)
+// =========================
 final class OrderService {
     private final OrderRepository orderRepo;
     private final RestaurantRepository restaurantRepo;
@@ -690,12 +1041,24 @@ final class OrderService {
     private final PaymentService paymentService;
     private final NotificationService notificationService;
 
+    // NEW
+    private final BillingService billingService;
+    private final PaymentRecordService paymentRecordService;
+    private final DeliveryService deliveryService;
+    private final CouponManager couponManager;
+    private final DeliveryChargeStrategyFactory deliveryChargeFactory;
+
     public OrderService(OrderRepository orderRepo,
                         RestaurantRepository restaurantRepo,
                         DriverRepository driverRepo,
                         DriverAssignmentStrategy driverStrategy,
                         PaymentService paymentService,
-                        NotificationService notificationService) {
+                        NotificationService notificationService,
+                        BillingService billingService,
+                        PaymentRecordService paymentRecordService,
+                        DeliveryService deliveryService,
+                        CouponManager couponManager,
+                        DeliveryChargeStrategyFactory deliveryChargeFactory) {
 
         this.orderRepo = orderRepo;
         this.restaurantRepo = restaurantRepo;
@@ -703,10 +1066,20 @@ final class OrderService {
         this.driverStrategy = driverStrategy;
         this.paymentService = paymentService;
         this.notificationService = notificationService;
+
+        this.billingService = billingService;
+        this.paymentRecordService = paymentRecordService;
+        this.deliveryService = deliveryService;
+        this.couponManager = couponManager;
+        this.deliveryChargeFactory = deliveryChargeFactory;
     }
 
-    // Core flow: validate -> price -> pay -> create order -> allocate -> assign driver -> notify
-    public Order placeOrder(User user, Cart cart, Address deliveryAddress) {
+    /*
+     * placeOrder:
+     * validate -> compute itemTotal -> compute deliveryFee (strategy) -> apply coupon -> tax -> create order
+     * -> create bill -> pay -> record payment -> allocate capacity -> create delivery -> assign driver -> notify
+     */
+    public Order placeOrder(User user, Cart cart, Address deliveryAddress, String couponCode, boolean surgeOn) {
         if (cart == null || cart.isEmpty()) throw new IllegalArgumentException("cart is empty");
         if (cart.getRestaurantId() == null) throw new IllegalArgumentException("cart has no restaurant");
 
@@ -718,46 +1091,84 @@ final class OrderService {
         }
 
         List<OrderLine> lines = cart.toOrderLines();
-        if (!restaurant.canFulfill(lines)) {
-            throw new IllegalStateException("restaurant cannot fulfill right now (menu/capacity)");
+        if (!restaurant.canFulfill(lines)) throw new IllegalStateException("restaurant cannot fulfill right now");
+
+        BigDecimal itemTotal = restaurant.calculateCost(lines);
+
+        // Delivery fee
+        DeliveryChargeStrategy deliveryStrategy = deliveryChargeFactory.create(surgeOn);
+        BigDecimal deliveryFee = deliveryStrategy.getPrice(restaurant.getAddress(), deliveryAddress);
+
+        // Coupon discount (on itemTotal only - keep simple)
+        BigDecimal discount = BigDecimal.ZERO;
+        Optional<Coupon> couponOpt = couponManager.find(couponCode);
+        if (couponOpt.isPresent()) {
+            Coupon c = couponOpt.get();
+            if (c.isEligible(user, itemTotal)) discount = c.discountAmount(itemTotal);
         }
 
-        BigDecimal amount = restaurant.calculateCost(lines);
-        PaymentStatus payStatus = paymentService.process(user, amount);
+        // Tax (simple constant 5% on itemTotal)
+        BigDecimal tax = itemTotal.multiply(new BigDecimal("0.05"));
+
+        // Create order (itemTotal now; payable after bill calc)
+        Order order = new Order(user.getId(), restaurant.getId(), deliveryAddress, lines, itemTotal);
+
+        // Create bill (final payable)
+        Bill bill = billingService.createBill(order.getId(), itemTotal, tax, discount, deliveryFee);
+        order.setBillId(bill.getBillId());
+        order.setPayableAmount(bill.getTotalAmountToBePaid());
+
+        // Payment
+        PaymentMode mode = user.getAccount().getPreferredPaymentMode();
+        PaymentStatus payStatus = paymentService.process(user, bill.getTotalAmountToBePaid());
+        order.markPayment(payStatus);
+
+        // Record payment attempt
+        paymentRecordService.record(bill.getBillId(), bill.getTotalAmountToBePaid(), payStatus, mode, couponCode);
+
         if (payStatus == PaymentStatus.FAILED) {
-            notificationService.notifyUser(user, "Payment failed. Please try again.");
-            Order failed = new Order(user.getId(), restaurant.getId(), deliveryAddress, lines, amount);
-            failed.markPayment(PaymentStatus.FAILED);
-            orderRepo.save(failed);
-            return failed;
+            orderRepo.save(order);
+            notificationService.notifyUser(user, "Payment failed. Please try again. OrderId=" + order.getId());
+            return order;
         }
 
-        // Payment success -> reserve capacity and create order
+        // Reserve capacity only after payment success (simplification)
         restaurant.allocateCapacity(lines);
-        Order order = new Order(user.getId(), restaurant.getId(), deliveryAddress, lines, amount);
-        order.markPayment(PaymentStatus.SUCCESS);
 
-        // Assign driver (optional)
+        // Create delivery entity
+        Delivery delivery = deliveryService.createForOrder(order.getId(), user, deliveryAddress);
+        order.setDeliveryId(delivery.getId());
+
+        // Assign driver
         Driver driver = driverStrategy.assign(driverRepo.findAll(), deliveryAddress.getLocation());
         if (driver != null && driver.isAvailable()) {
             order.assignDriver(driver.getId());
             driver.assignOrder(order.getId());
+            deliveryService.assignDriver(order.getId(), driver.getId());
         }
 
         orderRepo.save(order);
-        notificationService.notifyUser(user, "Order placed successfully. OrderId=" + order.getId());
         user.clearCart();
+
+        notificationService.notifyUser(user, "Order placed. OrderId=" + order.getId() + ", BillId=" + bill.getBillId());
         return order;
     }
 
-    // Driver / system advances state (State pattern)
+    // State advance + keep Delivery in sync
     public Order advanceOrder(String orderId) {
         Order order = orderRepo.findById(orderId);
         if (order == null) throw new IllegalArgumentException("order not found");
 
+        String before = order.getStatus();
         order.advance();
+        String after = order.getStatus();
 
-        // On delivered: release restaurant capacity, free driver
+        // Update delivery milestones
+        if (!before.equals(after)) {
+            if ("PICKED_UP".equals(after)) deliveryService.markPickedUp(orderId);
+            if ("DELIVERED".equals(after)) deliveryService.markDelivered(orderId);
+        }
+
         if (order.isDelivered()) {
             Restaurant r = restaurantRepo.findById(order.getRestaurantId());
             if (r != null) r.releaseCapacity(order.getLines());
@@ -771,38 +1182,27 @@ final class OrderService {
     }
 
     public Order track(String orderId) { return orderRepo.findById(orderId); }
+    public Delivery trackDelivery(String orderId) { return deliveryService.track(orderId); }
+    public Bill getBill(String orderId) { return billingService.getBillByOrder(orderId); }
 }
 
+// =========================
+// Order History Service
+// =========================
 final class OrderHistoryService {
     private final OrderRepository orderRepo;
+    public OrderHistoryService(OrderRepository orderRepo) { this.orderRepo = orderRepo; }
 
-    public OrderHistoryService(OrderRepository orderRepo) {
-        this.orderRepo = orderRepo;
-    }
-
-    public List<Order> getUserOrders(String userId) {
-        return orderRepo.findByUserId(userId);
-    }
-
-    public List<Order> getUserOrdersByStatus(String userId, String status) {
-        List<Order> all = orderRepo.findByUserId(userId);
-        List<Order> res = new ArrayList<>();
-        for (Order o : all) if (o.getStatus().equalsIgnoreCase(status)) res.add(o);
-        return res;
-    }
-
-    public List<Order> getLastN(String userId, int n) {
-        List<Order> all = orderRepo.findByUserId(userId);
-        if (n <= 0) return Collections.emptyList();
-        int from = Math.max(0, all.size() - n);
-        return all.subList(from, all.size());
-    }
+    // best: repo already indexed by userId
+    public List<Order> getUserOrders(String userId) { return orderRepo.findByUserId(userId); }
+    public List<Order> getUserOrdersByStatus(String userId, String status) { return orderRepo.findByUserIdAndStatus(userId, status); }
+    public List<Order> getLastN(String userId, int n) { return orderRepo.findByUserId(userId, n); }
 }
 
 // =========================
-// Demo (Minimal)
+// Demo
 // =========================
-public class FoodOrderingLLDDemo {
+public class FoodOrderingLLDDemo_Extended {
     public static void main(String[] args) {
         // Repos
         UserRepository userRepo = new InMemoryUserRepository();
@@ -810,19 +1210,32 @@ public class FoodOrderingLLDDemo {
         DriverRepository driverRepo = new InMemoryDriverRepository();
         OrderRepository orderRepo = new InMemoryOrderRepository();
 
+        BillRepository billRepo = new InMemoryBillRepository();
+        PaymentRepository paymentRepo = new InMemoryPaymentRepository();
+        DeliveryRepository deliveryRepo = new InMemoryDeliveryRepository();
+
         // Services
         UserService userService = new UserService(userRepo);
         RestaurantService restaurantService = new RestaurantService(restaurantRepo);
-        DriverService driverService = new DriverService(driverRepo);
 
         PaymentService paymentService = new PaymentService(new PaymentMethodFactory());
         NotificationService notificationService = new NotificationService(new NotificationFactory(), "SMS");
+
+        BillingService billingService = new BillingService(billRepo);
+        PaymentRecordService paymentRecordService = new PaymentRecordService(paymentRepo);
+        DeliveryService deliveryService = new DeliveryService(deliveryRepo);
+
+        CouponManager couponManager = new CouponManager();
+        DeliveryChargeStrategyFactory deliveryChargeFactory = new DeliveryChargeStrategyFactory();
+
         OrderService orderService = new OrderService(
                 orderRepo, restaurantRepo, driverRepo,
                 new NearestDriverAssignmentStrategy(),
-                paymentService,
-                notificationService
+                paymentService, notificationService,
+                billingService, paymentRecordService, deliveryService,
+                couponManager, deliveryChargeFactory
         );
+
         OrderHistoryService historyService = new OrderHistoryService(orderRepo);
 
         // Setup user
@@ -840,51 +1253,38 @@ public class FoodOrderingLLDDemo {
         r1.upsertMenuItem(new MenuItem("M2", "King Burger", new BigDecimal("15")));
         restaurantService.onboard(r1);
 
-        Restaurant r2 = new Restaurant("R2", "Food Court-2",
-                new Address("RA2", "FC2", "BTM", new Location(17.43, 78.38)),
-                12,
-                Arrays.asList("BTM", "HSR"));
-        r2.upsertMenuItem(new MenuItem("M3", "Bendi Macaroni", new BigDecimal("12")));
-        r2.upsertMenuItem(new MenuItem("M1", "Samosa Pizza", new BigDecimal("25")));
-        restaurantService.onboard(r2);
-
         // Setup drivers
         Driver d1 = new Driver("D1", "Driver-1", "dphone-1", new Location(17.44, 78.401));
         Driver d2 = new Driver("D2", "Driver-2", "dphone-2", new Location(17.40, 78.35));
-        driverService.register(d1);
-        driverService.register(d2);
-
-        // Search + Sort (strategy)
-        List<Restaurant> byDish = restaurantService.searchByDishName("samosa", home.getPincode());
-        byDish = restaurantService.sort(byDish, new SortByNameAsc());
-        System.out.println("Restaurants serving 'samosa' near pincode=" + home.getPincode());
-        for (Restaurant r : byDish) System.out.println(" - " + r.getName());
+        driverRepo.save(d1);
+        driverRepo.save(d2);
 
         // Cart flow
         Cart cart = u1.getOrCreateCart();
-        cart.selectRestaurant("R2");
-        cart.addItem("M3", 3);
-        cart.addItem("M1", 2);
+        cart.selectRestaurant("R1");
+        cart.addItem("M1", 3);
+        cart.addItem("M2", 2);
 
-        // Place order
-        Order order = orderService.placeOrder(u1, cart, home);
+        // Place order with coupon + surge pricing enabled
+        Order order = orderService.placeOrder(u1, cart, home, "BANK10", true);
         System.out.println("Placed: " + order);
+        System.out.println("Bill  : " + orderService.getBill(order.getId()));
+        System.out.println("Deliv : " + orderService.trackDelivery(order.getId()));
 
-        // Advance order states
+        // Advance states
         System.out.println("Status: " + orderService.track(order.getId()).getStatus());
-        orderService.advanceOrder(order.getId()); // CREATED -> ACCEPTED
+        orderService.advanceOrder(order.getId());
         System.out.println("Status: " + orderService.track(order.getId()).getStatus());
-        orderService.advanceOrder(order.getId()); // ACCEPTED -> PICKED_UP
+        orderService.advanceOrder(order.getId());
         System.out.println("Status: " + orderService.track(order.getId()).getStatus());
-        orderService.advanceOrder(order.getId()); // PICKED_UP -> DELIVERED (releases capacity, frees driver)
+        System.out.println("Deliv : " + orderService.trackDelivery(order.getId()));
+        orderService.advanceOrder(order.getId());
         System.out.println("Status: " + orderService.track(order.getId()).getStatus());
+        System.out.println("Deliv : " + orderService.trackDelivery(order.getId()));
 
-        // Rating
-        restaurantService.addRating(order.getRestaurantId(), new Review(5, "Nice food", u1.getId(), LocalDateTime.now()));
-        restaurantService.addRating(order.getRestaurantId(), new Review(4, "Good", u1.getId(), LocalDateTime.now()));
-
-        // History
-        System.out.println("Order history for user " + u1.getId() + " => " + historyService.getUserOrders(u1.getId()));
-        System.out.println("Delivered orders => " + historyService.getUserOrdersByStatus(u1.getId(), "DELIVERED"));
+        // History (best way: by userId index)
+        System.out.println("All orders of U1 => " + historyService.getUserOrders("U1"));
+        System.out.println("Delivered orders => " + historyService.getUserOrdersByStatus("U1", "DELIVERED"));
+        System.out.println("Last 1 order      => " + historyService.getLastN("U1", 1));
     }
 }

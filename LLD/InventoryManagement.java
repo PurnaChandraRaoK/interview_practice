@@ -1,3 +1,6 @@
+import java.time.LocalDate;
+import java.util.*;
+
 // ---------- Enums ----------
 enum ProductCategory {
     ELECTRONICS,
@@ -7,12 +10,18 @@ enum ProductCategory {
     OTHER
 }
 
+enum TransferStatus {
+    INITIATED,
+    IN_TRANSIT,
+    COMPLETED
+}
+
 // ---------- Model ----------
 abstract class Product {
     private final String sku;
     private final String name;
     private final double price;
-    private int quantity;          // warehouse-specific quantity (mutated by Warehouse)
+    private int quantity;          // On-hand (warehouse-specific)
     private final int threshold;
     private final ProductCategory category;
 
@@ -28,11 +37,10 @@ abstract class Product {
     public String getSku() { return sku; }
     public String getName() { return name; }
     public double getPrice() { return price; }
-    public int getQuantity() { return quantity; }
+    public int getQuantity() { return quantity; } // on-hand
     public int getThreshold() { return threshold; }
     public ProductCategory getCategory() { return category; }
 
-    // Keep mutation controlled
     void increaseQuantity(int delta) {
         if (delta <= 0) throw new IllegalArgumentException("delta must be > 0");
         quantity += delta;
@@ -40,7 +48,7 @@ abstract class Product {
 
     void decreaseQuantity(int delta) {
         if (delta <= 0) throw new IllegalArgumentException("delta must be > 0");
-        if (quantity < delta) throw new IllegalArgumentException("insufficient quantity");
+        if (quantity < delta) throw new IllegalArgumentException("insufficient on-hand quantity");
         quantity -= delta;
     }
 
@@ -98,7 +106,7 @@ final class GroceryProduct extends Product {
     public GroceryProduct(String sku, String name, double price, int quantity, int threshold,
                           LocalDate expiryDate, boolean refrigerated) {
         super(sku, name, price, quantity, threshold, ProductCategory.GROCERY);
-        this.expiryDate = expiryDate; // can be null if not applicable
+        this.expiryDate = expiryDate; // can be null
         this.refrigerated = refrigerated;
     }
 
@@ -108,11 +116,8 @@ final class GroceryProduct extends Product {
 
 // ---------- Factory ----------
 final class ProductFactory {
-
-    // Keep your factory pattern, but avoid switch explosion by keeping it simple.
     public Product createProduct(ProductCategory category, String sku, String name, double price, int quantity, int threshold) {
         Objects.requireNonNull(category, "category");
-
         return switch (category) {
             case ELECTRONICS -> new ElectronicsProduct(sku, name, price, quantity, threshold, "Generic", 12);
             case CLOTHING    -> new ClothingProduct(sku, name, price, quantity, threshold, "M", "Black");
@@ -126,7 +131,9 @@ final class ProductFactory {
 final class Warehouse {
     private final String name;
     private String location;
-    private final Map<String, Product> products = new HashMap<>(); // SKU -> Product
+
+    // SKU -> Product (contains on-hand quantity)
+    private final Map<String, Product> products = new HashMap<>();
 
     public Warehouse(String name) {
         this.name = requireNonBlank(name, "name");
@@ -134,13 +141,25 @@ final class Warehouse {
 
     public String getName() { return name; }
     public String getLocation() { return location; }
+    public void setLocation(String location) { this.location = location; }
 
-    public void setLocation(String location) {
-        this.location = location;
+    public int getOnHandQuantity(String sku) {
+        Product p = products.get(sku);
+        return p == null ? 0 : p.getQuantity();
     }
 
-    // Add quantity to warehouse inventory
-    public void addProduct(Product product, int quantityToAdd) {
+    // With reservation removed, available == on-hand
+    public int getAvailableQuantity(String sku) {
+        return getOnHandQuantity(sku);
+    }
+
+    public Product getProductBySku(String sku) { return products.get(sku); }
+
+    public Collection<Product> getAllProducts() {
+        return Collections.unmodifiableCollection(products.values());
+    }
+
+    public synchronized void addProduct(Product product, int quantityToAdd) {
         Objects.requireNonNull(product, "product");
         if (quantityToAdd <= 0) throw new IllegalArgumentException("quantityToAdd must be > 0");
 
@@ -150,17 +169,16 @@ final class Warehouse {
         if (existing != null) {
             existing.increaseQuantity(quantityToAdd);
         } else {
-            // store the provided product instance in this warehouse
-            product.increaseQuantity(quantityToAdd); // aligns with your existing behavior (sets/updates)
+            product.increaseQuantity(quantityToAdd);
             products.put(sku, product);
         }
 
         System.out.println(quantityToAdd + " units of " + product.getName()
                 + " (SKU: " + sku + ") added to " + name
-                + ". New quantity: " + getAvailableQuantity(sku));
+                + ". OnHand: " + getOnHandQuantity(sku));
     }
 
-    public boolean removeProduct(String sku, int quantityToRemove) {
+    public synchronized boolean removeProduct(String sku, int quantityToRemove) {
         if (sku == null || sku.trim().isEmpty()) throw new IllegalArgumentException("sku cannot be blank");
         if (quantityToRemove <= 0) throw new IllegalArgumentException("quantityToRemove must be > 0");
 
@@ -170,36 +188,24 @@ final class Warehouse {
             return false;
         }
 
-        int currentQty = product.getQuantity();
-        if (currentQty < quantityToRemove) {
-            System.out.println("Error: Insufficient inventory. Requested: " + quantityToRemove + ", Available: " + currentQty);
+        int onHand = product.getQuantity();
+        if (onHand < quantityToRemove) {
+            System.out.println("Error: Insufficient inventory. Requested: " + quantityToRemove + ", OnHand: " + onHand);
             return false;
         }
 
         product.decreaseQuantity(quantityToRemove);
+
         System.out.println(quantityToRemove + " units of " + product.getName()
                 + " (SKU: " + sku + ") removed from " + name
-                + ". Remaining quantity: " + product.getQuantity());
+                + ". OnHand now: " + product.getQuantity());
 
         if (product.getQuantity() == 0) {
             products.remove(sku);
-            System.out.println("Product " + product.getName() + " removed from inventory as quantity is now zero.");
+            System.out.println("Product " + product.getName() + " removed from inventory as on-hand is now zero.");
         }
 
         return true;
-    }
-
-    public int getAvailableQuantity(String sku) {
-        Product p = products.get(sku);
-        return p == null ? 0 : p.getQuantity();
-    }
-
-    public Product getProductBySku(String sku) {
-        return products.get(sku);
-    }
-
-    public Collection<Product> getAllProducts() {
-        return Collections.unmodifiableCollection(products.values());
     }
 
     private static String requireNonBlank(String v, String field) {
@@ -217,7 +223,6 @@ final class JustInTimeStrategy implements ReplenishmentStrategy {
     @Override
     public void replenish(Product product) {
         System.out.println("Applying Just-In-Time replenishment for " + product.getName());
-        // Keep empty for interview (plug real logic later)
     }
 }
 
@@ -225,19 +230,54 @@ final class BulkOrderStrategy implements ReplenishmentStrategy {
     @Override
     public void replenish(Product product) {
         System.out.println("Applying Bulk Order replenishment for " + product.getName());
-        // Keep empty for interview (plug real logic later)
     }
 }
 
-// ---------- Inventory Manager (no Singleton) ----------
+// ---------- Stock Transfer ----------
+final class StockTransfer {
+    private final String transferId;
+    private final String fromWarehouse;
+    private final String toWarehouse;
+    private final String sku;
+    private final int qty;
+    private TransferStatus status;
+
+    StockTransfer(String transferId, String fromWarehouse, String toWarehouse, String sku, int qty) {
+        this.transferId = requireNonBlank(transferId, "transferId");
+        this.fromWarehouse = requireNonBlank(fromWarehouse, "fromWarehouse");
+        this.toWarehouse = requireNonBlank(toWarehouse, "toWarehouse");
+        this.sku = requireNonBlank(sku, "sku");
+        if (qty <= 0) throw new IllegalArgumentException("qty must be > 0");
+        this.qty = qty;
+        this.status = TransferStatus.INITIATED;
+    }
+
+    public String getTransferId() { return transferId; }
+    public TransferStatus getStatus() { return status; }
+    public void setStatus(TransferStatus status) { this.status = Objects.requireNonNull(status); }
+
+    public String getFromWarehouse() { return fromWarehouse; }
+    public String getToWarehouse() { return toWarehouse; }
+    public String getSku() { return sku; }
+    public int getQty() { return qty; }
+
+    private static String requireNonBlank(String v, String field) {
+        if (v == null || v.trim().isEmpty()) throw new IllegalArgumentException(field + " cannot be blank");
+        return v.trim();
+    }
+}
+
+// ---------- Inventory Manager ----------
 final class InventoryManager {
     private final List<Warehouse> warehouses = new ArrayList<>();
     private final ProductFactory productFactory;
     private ReplenishmentStrategy replenishmentStrategy;
 
+    private final Map<String, StockTransfer> transfers = new HashMap<>(); // idempotent by transferId
+
     public InventoryManager(ProductFactory productFactory, ReplenishmentStrategy replenishmentStrategy) {
         this.productFactory = Objects.requireNonNull(productFactory, "productFactory");
-        this.replenishmentStrategy = replenishmentStrategy; // can be null
+        this.replenishmentStrategy = replenishmentStrategy;
     }
 
     public void setReplenishmentStrategy(ReplenishmentStrategy replenishmentStrategy) {
@@ -248,12 +288,15 @@ final class InventoryManager {
         warehouses.add(Objects.requireNonNull(warehouse, "warehouse"));
     }
 
-    public void removeWarehouse(Warehouse warehouse) {
-        warehouses.remove(warehouse);
-    }
-
     public Product createProduct(ProductCategory category, String sku, String name, double price, int quantity, int threshold) {
         return productFactory.createProduct(category, sku, name, price, quantity, threshold);
+    }
+
+    public Warehouse getWarehouseByName(String name) {
+        for (Warehouse w : warehouses) {
+            if (w.getName().equalsIgnoreCase(name)) return w;
+        }
+        return null;
     }
 
     public Product getProductBySku(String sku) {
@@ -284,6 +327,74 @@ final class InventoryManager {
             }
         }
     }
+
+    // ---------- Stock Transfer (Atomic movement + status) ----------
+    public StockTransfer transferStock(String transferId, String fromWh, String toWh, String sku, int qty) {
+        if (qty <= 0) throw new IllegalArgumentException("qty must be > 0");
+
+        // Idempotent: return existing transfer if retried
+        StockTransfer existing = transfers.get(transferId);
+        if (existing != null) return existing;
+
+        Warehouse from = requireWarehouse(fromWh);
+        Warehouse to = requireWarehouse(toWh);
+
+        StockTransfer t = new StockTransfer(transferId, fromWh, toWh, sku, qty);
+        transfers.put(transferId, t);
+
+        // Lock ordering to avoid deadlocks
+        Warehouse first = from.getName().compareToIgnoreCase(to.getName()) <= 0 ? from : to;
+        Warehouse second = (first == from) ? to : from;
+
+        synchronized (first) {
+            synchronized (second) {
+                t.setStatus(TransferStatus.INITIATED);
+
+                if (from.getAvailableQuantity(sku) < qty) {
+                    System.out.println("Transfer failed: insufficient stock in source. sku=" + sku
+                            + " qty=" + qty + " onHand=" + from.getOnHandQuantity(sku));
+                    return t;
+                }
+
+                // capture source product before removal (might become 0 and removed)
+                Product src = from.getProductBySku(sku);
+                if (src == null) {
+                    System.out.println("Transfer failed: sku not found in source: " + sku);
+                    return t;
+                }
+
+                t.setStatus(TransferStatus.IN_TRANSIT);
+
+                boolean removed = from.removeProduct(sku, qty);
+                if (!removed) return t;
+
+                Product dest = to.getProductBySku(sku);
+                if (dest == null) {
+                    Product cloned = productFactory.createProduct(
+                            src.getCategory(), src.getSku(), src.getName(), src.getPrice(), 0, src.getThreshold()
+                    );
+                    to.addProduct(cloned, qty);
+                } else {
+                    to.addProduct(dest, qty);
+                }
+
+                t.setStatus(TransferStatus.COMPLETED);
+                System.out.println("Transfer completed: " + transferId + " status=" + t.getStatus());
+                return t;
+            }
+        }
+    }
+
+    public TransferStatus getTransferStatus(String transferId) {
+        StockTransfer t = transfers.get(transferId);
+        return t == null ? null : t.getStatus();
+    }
+
+    private Warehouse requireWarehouse(String name) {
+        Warehouse w = getWarehouseByName(name);
+        if (w == null) throw new IllegalArgumentException("Warehouse not found: " + name);
+        return w;
+    }
 }
 
 // ---------- Demo ----------
@@ -299,15 +410,14 @@ public class Main {
 
         Product laptop = manager.createProduct(ProductCategory.ELECTRONICS, "SKU123", "Laptop", 1000.0, 0, 25);
         Product tshirt = manager.createProduct(ProductCategory.CLOTHING, "SKU456", "T-Shirt", 20.0, 0, 100);
-        Product apple  = manager.createProduct(ProductCategory.GROCERY, "SKU789", "Apple", 1.0, 0, 200);
 
         w1.addProduct(laptop, 15);
         w1.addProduct(tshirt, 20);
-        w2.addProduct(apple, 50);
 
         manager.performInventoryCheck();
 
-        manager.setReplenishmentStrategy(new BulkOrderStrategy());
-        manager.checkAndReplenish("SKU123");
+        System.out.println("\n--- TRANSFER STOCK (atomic + status) ---");
+        StockTransfer t = manager.transferStock("T1", "Warehouse 1", "Warehouse 2", "SKU456", 5);
+        System.out.println("Transfer " + t.getTransferId() + " status=" + t.getStatus());
     }
 }

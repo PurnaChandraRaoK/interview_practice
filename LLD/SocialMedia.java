@@ -25,33 +25,59 @@ public class SocialMediaLLD {
         public String getUsername() { return username; }
     }
 
-    /**
-     * Keeping Post simple: id, authorId, type, content, timestamps.
-     * If you want richer model later: attachments, visibility, tags, etc.
-     */
-    public static final class Post {
+    static abstract class Post {
         private final String postId;
         private final String authorId;
-        private final PostType type;
-        private final String content;
         private final Instant createdAt;
-        private Instant updatedAt;
 
-        public Post(String postId, String authorId, PostType type, String content, Instant createdAt) {
+        protected Post(String postId, String authorId, Instant createdAt) {
             this.postId = Objects.requireNonNull(postId);
             this.authorId = Objects.requireNonNull(authorId);
-            this.type = Objects.requireNonNull(type);
-            this.content = Objects.requireNonNull(content);
             this.createdAt = Objects.requireNonNull(createdAt);
         }
 
         public String getPostId() { return postId; }
         public String getAuthorId() { return authorId; }
-        public PostType getType() { return type; }
-        public String getContent() { return content; }
         public Instant getCreatedAt() { return createdAt; }
-        public Instant getUpdatedAt() { return updatedAt; }
-        public void touch() { this.updatedAt = Instant.now(); }
+
+        public abstract PostType getType();
+        public abstract String getContent();
+    }
+
+    static final class TextPost extends Post {
+        private final String text;
+
+        TextPost(String postId, String authorId, String text, Instant createdAt) {
+            super(postId, authorId, createdAt);
+            this.text = Objects.requireNonNull(text);
+        }
+
+        @Override public PostType getType() { return PostType.TEXT; }
+        @Override public String getContent() { return text; }
+    }
+
+    static final class ImagePost extends Post {
+        private final String imageUrl;
+
+        ImagePost(String postId, String authorId, String imageUrl, Instant createdAt) {
+            super(postId, authorId, createdAt);
+            this.imageUrl = Objects.requireNonNull(imageUrl);
+        }
+
+        @Override public PostType getType() { return PostType.IMAGE; }
+        @Override public String getContent() { return imageUrl; }
+    }
+
+    static final class VideoPost extends Post {
+        private final String videoUrl;
+
+        VideoPost(String postId, String authorId, String videoUrl, Instant createdAt) {
+            super(postId, authorId, createdAt);
+            this.videoUrl = Objects.requireNonNull(videoUrl);
+        }
+
+        @Override public PostType getType() { return PostType.VIDEO; }
+        @Override public String getContent() { return videoUrl; }
     }
 
     public static final class Comment {
@@ -137,15 +163,7 @@ public class SocialMediaLLD {
         /** Returns iterator of user's posts in DESC timestamp order (newest first). */
         Iterator<PostRef> iterateUserPostsDesc(String userId);
     }
-
-    public interface CommentRepository {
-        void addRootComment(String postId, Comment comment);
-        List<Comment> getRootComments(String postId);
-
-        Comment findComment(String postId, String commentId);
-        boolean deleteComment(String postId, String commentId);
-    }
-
+    
     public interface NotificationService {
         void notify(String userId, String message);
         List<String> getNotifications(String userId);
@@ -258,41 +276,65 @@ public class SocialMediaLLD {
             return dq.iterator(); // already newest-first
         }
     }
+    interface CommentRepository {
+        void addRootComment(String postId, Comment c);
+        Comment findComment(String postId, String commentId);
+        List<Comment> getRootComments(String postId);
+        boolean deleteComment(String postId, String commentId);
+    }
 
-    public static final class InMemoryCommentRepository implements CommentRepository {
-        private final Map<String, List<Comment>> postToRootComments = new ConcurrentHashMap<>();
+    static final class InMemoryCommentRepository implements CommentRepository {
+        private final Map<String, List<Comment>> rootCommentsByPost = new HashMap<>();
 
-        @Override
-        public void addRootComment(String postId, Comment comment) {
-            postToRootComments.computeIfAbsent(postId, k -> Collections.synchronizedList(new ArrayList<>()))
-                    .add(comment);
+        @Override public void addRootComment(String postId, Comment c) {
+            rootCommentsByPost.computeIfAbsent(postId, k -> new ArrayList<>()).add(c);
         }
 
-        @Override
-        public List<Comment> getRootComments(String postId) {
-            return Collections.unmodifiableList(postToRootComments.getOrDefault(postId, Collections.emptyList()));
-        }
-
-        @Override
-        public Comment findComment(String postId, String commentId) {
-            for (Comment root : postToRootComments.getOrDefault(postId, Collections.emptyList())) {
-                Comment found = root.findById(commentId);
+        @Override public Comment findComment(String postId, String commentId) {
+            for (Comment c : getRootComments(postId)) {
+                Comment found = findInTree(c, commentId);
                 if (found != null) return found;
             }
             return null;
         }
 
-        @Override
-        public boolean deleteComment(String postId, String commentId) {
-            List<Comment> roots = postToRootComments.getOrDefault(postId, Collections.emptyList());
+        private Comment findInTree(Comment node, String id) {
+            if (node.getCommentId().equals(id)) return node;
+            for (Comment r : node.replies) {
+                Comment found = findInTree(r, id);
+                if (found != null) return found;
+            }
+            return null;
+        }
 
-            // remove root
-            boolean removedRoot = roots.removeIf(c -> c.getCommentId().equals(commentId));
-            if (removedRoot) return true;
+        @Override public List<Comment> getRootComments(String postId) {
+            return rootCommentsByPost.getOrDefault(postId, Collections.emptyList());
+        }
 
-            // remove nested
-            for (Comment root : roots) {
-                if (root.deleteReplyById(commentId)) return true;
+        @Override public boolean deleteComment(String postId, String commentId) {
+            List<Comment> roots = rootCommentsByPost.get(postId);
+            if (roots == null) return false;
+
+            // try delete from roots first
+            boolean removed = roots.removeIf(c -> c.getCommentId().equals(commentId));
+            if (removed) return true;
+
+            // else try delete in replies
+            for (Comment c : roots) {
+                if (deleteInTree(c, commentId)) return true;
+            }
+            return false;
+        }
+
+        private boolean deleteInTree(Comment node, String id) {
+            Iterator<Comment> it = node.replies.iterator();
+            while (it.hasNext()) {
+                Comment child = it.next();
+                if (child.getCommentId().equals(id)) {
+                    it.remove();
+                    return true;
+                }
+                if (deleteInTree(child, id)) return true;
             }
             return false;
         }
@@ -318,21 +360,27 @@ public class SocialMediaLLD {
         Post create(String postId, String authorId, String content);
     }
 
-    public static final class PostFactory {
-        private final Map<PostType, PostCreator> creators = new EnumMap<>(PostType.class);
-
-        public PostFactory() {
-            creators.put(PostType.TEXT,  (id, author, content) -> new Post(id, author, PostType.TEXT,  content, Instant.now()));
-            creators.put(PostType.IMAGE, (id, author, content) -> new Post(id, author, PostType.IMAGE, content, Instant.now()));
-            creators.put(PostType.VIDEO, (id, author, content) -> new Post(id, author, PostType.VIDEO, content, Instant.now()));
+    class PostFactory {
+        interface PostCreator {
+            Post create(String id, String authorId, String content, Instant createdAt);
         }
 
-        public void register(PostType type, PostCreator creator) { creators.put(type, creator); }
+        private final Map<PostType, PostCreator> creators = new EnumMap<>(PostType.class);
+
+        PostFactory() {
+            creators.put(PostType.TEXT, (id, author, content, ts) -> new TextPost(id, author, content, ts));
+            creators.put(PostType.IMAGE, (id, author, content, ts) -> new ImagePost(id, author, content, ts));
+            creators.put(PostType.VIDEO, (id, author, content, ts) -> new VideoPost(id, author, content, ts));
+        }
+
+        public void register(PostType type, PostCreator creator) {
+            creators.put(type, creator);
+        }
 
         public Post create(PostType type, String authorId, String content) {
             PostCreator creator = creators.get(type);
             if (creator == null) throw new IllegalArgumentException("Unsupported post type: " + type);
-            return creator.create(Id.next(), authorId, content);
+            return creator.create(Id.next(), authorId, content, Instant.now());
         }
     }
 

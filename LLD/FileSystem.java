@@ -22,6 +22,11 @@ public class InMemoryFileSystem {
         void delete(String path);                 // delete file OR empty dir
         void deleteRecursive(String path);        // recursive delete
         void move(String sourcePath, String destPath); // move/rename
+
+        // ✅ NEW: Existence checks
+        boolean exists(String path);
+        boolean fileExists(String path);
+        boolean dirExists(String path);
     }
 
     public enum ParentCreationMode { STRICT, AUTO_CREATE }
@@ -37,7 +42,7 @@ public class InMemoryFileSystem {
         return new FileSystemImpl(policy, new DefaultNodeFactory());
     }
 
-    // ===== Exceptions (clear error semantics for correctness) =====
+    // ===== Exceptions =====
 
     public static class FsException extends RuntimeException {
         public FsException(String message) { super(message); }
@@ -73,7 +78,7 @@ public class InMemoryFileSystem {
         }
     }
 
-    // ===== Design Pattern: Composite =====
+    // ===== Composite =====
 
     private interface Node {
         String name();
@@ -135,7 +140,6 @@ public class InMemoryFileSystem {
     }
 
     private static final class DirectoryNode extends AbstractNode {
-        // name -> child node
         private final Map<String, Node> children = new HashMap<>();
 
         private DirectoryNode(String name, DirectoryNode parent) {
@@ -144,11 +148,9 @@ public class InMemoryFileSystem {
 
         @Override public boolean isDirectory() { return true; }
 
-        public boolean hasChild(String name) { return children.containsKey(name); }
-
         public Node getChild(String name) { return children.get(name); }
-
         public Collection<Node> children() { return children.values(); }
+        public boolean isEmpty() { return children.isEmpty(); }
 
         public void addChild(Node child) {
             Objects.requireNonNull(child, "child");
@@ -161,8 +163,6 @@ public class InMemoryFileSystem {
 
         public Node removeChild(String name) { return children.remove(name); }
 
-        public boolean isEmpty() { return children.isEmpty(); }
-
         public List<String> listNamesSorted() {
             List<String> names = new ArrayList<>(children.keySet());
             Collections.sort(names);
@@ -170,7 +170,7 @@ public class InMemoryFileSystem {
         }
     }
 
-    // ===== Design Pattern: Factory =====
+    // ===== Factory =====
 
     private interface NodeFactory {
         DirectoryNode newDirectory(String name, DirectoryNode parent);
@@ -187,13 +187,12 @@ public class InMemoryFileSystem {
         }
     }
 
-    // ===== Design Pattern: Strategy (Parent creation policy) =====
+    // ===== Strategy =====
 
     private interface ParentCreationPolicy {
         DirectoryNode ensureParentExists(DirectoryNode root, List<String> parentSegments, NodeFactory factory);
     }
 
-    // Strict: fail if any parent directory is missing
     private static final class StrictParentCreationPolicy implements ParentCreationPolicy {
         @Override
         public DirectoryNode ensureParentExists(DirectoryNode root, List<String> parentSegments, NodeFactory factory) {
@@ -208,7 +207,6 @@ public class InMemoryFileSystem {
         }
     }
 
-    // Auto-create: create missing parents as directories
     private static final class AutoCreateParentCreationPolicy implements ParentCreationPolicy {
         @Override
         public DirectoryNode ensureParentExists(DirectoryNode root, List<String> parentSegments, NodeFactory factory) {
@@ -234,14 +232,45 @@ public class InMemoryFileSystem {
         private final DirectoryNode root;
         private final ParentCreationPolicy parentPolicy;
         private final NodeFactory factory;
-
-        // coarse-grained lock is enough for interview correctness (keeps it simple)
         private final ReentrantReadWriteLock rwLock = new ReentrantReadWriteLock(true);
 
         private FileSystemImpl(ParentCreationPolicy parentPolicy, NodeFactory factory) {
-            this.root = new DirectoryNode("", null); // root
+            this.root = new DirectoryNode("", null);
             this.parentPolicy = Objects.requireNonNull(parentPolicy, "parentPolicy");
             this.factory = Objects.requireNonNull(factory, "factory");
+        }
+
+        // ✅ NEW: Existence checks (no exceptions for "not found")
+        @Override
+        public boolean exists(String path) {
+            rwLock.readLock().lock();
+            try {
+                return tryResolve(path) != null;
+            } finally {
+                rwLock.readLock().unlock();
+            }
+        }
+
+        @Override
+        public boolean fileExists(String path) {
+            rwLock.readLock().lock();
+            try {
+                Node n = tryResolve(path);
+                return n != null && !n.isDirectory();
+            } finally {
+                rwLock.readLock().unlock();
+            }
+        }
+
+        @Override
+        public boolean dirExists(String path) {
+            rwLock.readLock().lock();
+            try {
+                Node n = tryResolve(path);
+                return n != null && n.isDirectory();
+            } finally {
+                rwLock.readLock().unlock();
+            }
         }
 
         @Override
@@ -249,14 +278,14 @@ public class InMemoryFileSystem {
             rwLock.writeLock().lock();
             try {
                 PathParts parts = PathUtil.parse(path);
-                if (parts.isRoot()) return; // mkdir("/") no-op
+                if (parts.isRoot()) return;
 
                 DirectoryNode parent = parentPolicy.ensureParentExists(root, parts.parentSegments(), factory);
                 String name = parts.leafName();
 
                 Node existing = parent.getChild(name);
                 if (existing != null) {
-                    if (existing.isDirectory()) return; // mkdir existing dir => no-op
+                    if (existing.isDirectory()) return;
                     throw new AlreadyExistsException(path);
                 }
 
@@ -326,9 +355,7 @@ public class InMemoryFileSystem {
             rwLock.readLock().lock();
             try {
                 Node node = resolve(path);
-                if (!node.isDirectory()) {
-                    return Collections.singletonList(node.name());
-                }
+                if (!node.isDirectory()) return Collections.singletonList(node.name());
                 return ((DirectoryNode) node).listNamesSorted();
             } finally {
                 rwLock.readLock().unlock();
@@ -367,7 +394,6 @@ public class InMemoryFileSystem {
                 Node target = parent.getChild(parts.leafName());
                 if (target == null) throw new NotFoundException(path);
 
-                // Remove subtree by disconnecting from parent (GC will reclaim)
                 parent.removeChild(parts.leafName());
             } finally {
                 rwLock.writeLock().unlock();
@@ -391,7 +417,6 @@ public class InMemoryFileSystem {
                 DirectoryNode dstParent = parentPolicy.ensureParentExists(root, dstParts.parentSegments(), factory);
                 String dstName = dstParts.leafName();
 
-                // Prevent moving a directory into its own subtree
                 if (srcNode.isDirectory()) {
                     Node check = dstParent;
                     while (check != null && check.parent() != null) {
@@ -402,10 +427,7 @@ public class InMemoryFileSystem {
 
                 if (dstParent.getChild(dstName) != null) throw new AlreadyExistsException(dst);
 
-                // detach
                 srcParent.removeChild(srcNode.name());
-
-                // attach with new name
                 Node renamed = renameNode(srcNode, dstName, dstParent);
                 dstParent.addChild(renamed);
 
@@ -416,17 +438,34 @@ public class InMemoryFileSystem {
 
         // ---- Internal helpers ----
 
+        /**
+         * Strict resolver: throws if invalid/missing.
+         */
         private Node resolve(String path) {
+            Node node = tryResolve(path);
+            if (node == null) throw new NotFoundException(PathUtil.normalize(path));
+            return node;
+        }
+
+        /**
+         * Safe resolver: returns null when not found.
+         * Still throws for invalid path format (because "exists" on invalid path should not silently pass).
+         */
+        private Node tryResolve(String path) {
             String norm = PathUtil.normalize(path);
             if ("/".equals(norm)) return root;
 
             PathParts parts = PathUtil.parse(norm);
             DirectoryNode curr = root;
 
-            for (String seg : parts.segments()) {
+            for (int i = 0; i < parts.segments().size(); i++) {
+                String seg = parts.segments().get(i);
                 Node next = curr.getChild(seg);
-                if (next == null) throw new NotFoundException(norm);
-                if (seg.equals(parts.leafName())) return next;
+                if (next == null) return null;
+
+                boolean isLeaf = (i == parts.segments().size() - 1);
+                if (isLeaf) return next;
+
                 if (!next.isDirectory()) throw new NotADirectoryException(pathOf(curr, seg));
                 curr = (DirectoryNode) next;
             }
@@ -434,20 +473,14 @@ public class InMemoryFileSystem {
         }
 
         private Node renameNode(Node node, String newName, DirectoryNode newParent) {
-            // Create a new node object to keep fields immutable & avoid side-effects.
-            // (Keeps correctness simple; easy to extend with metadata copy.)
             if (node.isDirectory()) {
                 DirectoryNode oldDir = (DirectoryNode) node;
                 DirectoryNode newDir = factory.newDirectory(newName, newParent);
-                // move children over
-                for (Node child : oldDir.children()) {
-                    newDir.addChild(child);
-                }
+                for (Node child : oldDir.children()) newDir.addChild(child);
                 return newDir;
             } else {
                 FileNode oldFile = (FileNode) node;
-                FileNode newFile = factory.newFile(newName, newParent, oldFile.read());
-                return newFile;
+                return factory.newFile(newName, newParent, oldFile.read());
             }
         }
     }
@@ -501,7 +534,6 @@ public class InMemoryFileSystem {
         }
     }
 
-    // Small helpers to build paths for error messages
     private static String joinAbsolute(List<String> segments) {
         if (segments == null || segments.isEmpty()) return "/";
         StringBuilder sb = new StringBuilder("/");
@@ -518,19 +550,19 @@ public class InMemoryFileSystem {
         return base + "/" + childName;
     }
 
-    // ===== Example usage (optional for interview) =====
+    // ===== Example usage =====
     public static void main(String[] args) {
         FileSystem fs = InMemoryFileSystem.create(ParentCreationMode.STRICT);
 
+        System.out.println(fs.exists("/"));        // true
+        System.out.println(fs.dirExists("/a"));    // false
+
         fs.mkdir("/a");
-        fs.mkdir("/a/b");
-        fs.createFile("/a/b/c.txt", "hello");
-        fs.appendToFile("/a/b/c.txt", " world");
-        System.out.println(fs.readFile("/a/b/c.txt")); // hello world
-        System.out.println(fs.ls("/a"));               // [b]
-        fs.move("/a/b/c.txt", "/a/c2.txt");
-        System.out.println(fs.ls("/a"));               // [b, c2.txt]
-        fs.delete("/a/c2.txt");
-        fs.delete("/a/b");                             // ok (empty)
+        fs.createFile("/a/x.txt", "hi");
+
+        System.out.println(fs.exists("/a"));       // true
+        System.out.println(fs.dirExists("/a"));    // true
+        System.out.println(fs.fileExists("/a"));   // false
+        System.out.println(fs.fileExists("/a/x.txt")); // true
     }
 }

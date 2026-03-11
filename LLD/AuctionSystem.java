@@ -411,3 +411,63 @@ final class AuctionManagementSystem {
         return user;
     }
 }
+
+public class Main {
+    public static void main(String[] args) {
+        // 1) Get Singleton (Mediator)
+        AuctionManagementSystem system = AuctionManagementSystem.getInstance();
+
+        // 2) Register users
+        User seller = new User("U1", "Seller-Sam", "seller@x.com");
+        User alice  = new User("U2", "Alice", "alice@x.com");
+        User bob    = new User("U3", "Bob", "bob@x.com");
+
+        system.registerUser(seller);
+        system.registerUser(alice);
+        system.registerUser(bob);
+
+        // 3) Create item
+        Item item = new Item("I1", "MacBook Pro", "M3 Pro 16-inch", new BigDecimal("1000"));
+
+        // 4) Create auction (Factory used inside)
+        String auctionId = "A1";
+        system.createTimedAuction(auctionId, item, seller.getId(), 30);
+
+        // 5) Start auction (State: Created -> Active)
+        system.startAuction(auctionId);
+
+        // 6) Register bidding strategies per bidder (Strategy pattern)
+        // Alice: Auto-bid up to 1300, increments by 50
+        system.setBiddingStrategy(
+                auctionId,
+                alice.getId(),
+                new MaxAutoBidStrategy(new BigDecimal("1300"), new BigDecimal("50"))
+        );
+
+        // Bob: Manual bidding (you can skip this; default is ManualBidStrategy anyway)
+        system.setBiddingStrategy(auctionId, bob.getId(), new ManualBidStrategy());
+
+        // 7) Place bids (Mediator entry point -> Strategy -> Auction State validation -> Observer notification)
+        // Bob bids 1100 manually
+        system.placeBid(auctionId, bob.getId(), new BigDecimal("1100"));
+
+        // Alice tries to bid (auto strategy ignores input; will compute = currentHighest + increment)
+        system.placeBid(auctionId, alice.getId(), new BigDecimal("9999")); // ignored by auto strategy
+
+        // Bob tries again 1200
+        system.placeBid(auctionId, bob.getId(), new BigDecimal("1200"));
+
+        // Alice auto-bids again (will go to 1250 if currentHighest is 1200, minIncrement=50)
+        system.placeBid(auctionId, alice.getId(), BigDecimal.ZERO);
+
+        // 8) End auction (State: Active -> Ended)
+        system.endAuction(auctionId);
+
+        // 9) Print final state / history
+        Auction auction = system.getAuction(auctionId);
+        System.out.println("\n==== Final Result ====");
+        System.out.println("Highest Bid: " + auction.getCurrentHighestBid());
+        System.out.println("Winner: " + (auction.getHighestBidder() == null ? "None" : auction.getHighestBidder().getName()));
+        System.out.println("Bid History Count: " + auction.getBidHistory().size());
+    }
+}

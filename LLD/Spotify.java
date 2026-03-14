@@ -8,6 +8,7 @@ import java.util.concurrent.ConcurrentHashMap;
  * - Playback: queue, shuffle, repeat, state machine
  * - Library: likes, recents
  * - Subscription + Charges: user must subscribe before listening
+ * - Iterator Pattern for Playlist traversal (SIMPLE / SHUFFLED / FAVORITES)
  *
  * NOTE: Minimal implementation by design (LLD focus).
  */
@@ -72,6 +73,64 @@ public class SpotifyFinalLLD {
         @Override public String toString() { return title + "(" + id + ")"; }
     }
 
+    // -------------------- Iterator Pattern for Playlist --------------------
+    enum PlaylistIterType { SIMPLE, SHUFFLED, FAVORITES }
+
+    interface PlaylistIterator {
+        boolean hasNext();
+        String next(); // returns songId
+    }
+
+    static final class SimplePlaylistIterator implements PlaylistIterator {
+        private final List<String> songIds;
+        private int index = 0;
+
+        SimplePlaylistIterator(Playlist playlist) {
+            // snapshot traversal (avoids surprises if playlist mutates)
+            this.songIds = new ArrayList<>(playlist.songIdsView());
+        }
+
+        @Override public boolean hasNext() { return index < songIds.size(); }
+
+        @Override public String next() { return songIds.get(index++); }
+    }
+
+    static final class ShuffledPlaylistIterator implements PlaylistIterator {
+        private final List<String> shuffled;
+        private int index = 0;
+
+        ShuffledPlaylistIterator(Playlist playlist) {
+            this.shuffled = new ArrayList<>(playlist.songIdsView());
+            Collections.shuffle(this.shuffled);
+        }
+
+        @Override public boolean hasNext() { return index < shuffled.size(); }
+
+        @Override public String next() { return shuffled.get(index++); }
+    }
+
+    static final class FavoritesPlaylistIterator implements PlaylistIterator {
+        private final List<String> songIds;
+        private final Set<String> likedSet;
+        private int index = 0;
+
+        FavoritesPlaylistIterator(Playlist playlist, LibraryService library, String userId) {
+            // snapshot both playlist order + likes at iterator creation time
+            this.songIds = new ArrayList<>(playlist.songIdsView());
+            this.likedSet = new HashSet<>(library.likedSongs(userId));
+        }
+
+        @Override public boolean hasNext() {
+            while (index < songIds.size()) {
+                if (likedSet.contains(songIds.get(index))) return true;
+                index++;
+            }
+            return false;
+        }
+
+        @Override public String next() { return songIds.get(index++); }
+    }
+
     static final class Playlist {
         final String id;
         final String ownerUserId;
@@ -98,6 +157,21 @@ public class SpotifyFinalLLD {
         List<String> songIdsView() { return Collections.unmodifiableList(songIds); }
         boolean isPublic() { return isPublic; }
         void setPublic(boolean val) { isPublic = val; }
+
+        // Iterator factory (hides internal collection + supports different traversal strategies)
+        PlaylistIterator iterator(PlaylistIterType type, LibraryService library, String userId) {
+            if (type == null) type = PlaylistIterType.SIMPLE;
+            switch (type) {
+                case SIMPLE:
+                    return new SimplePlaylistIterator(this);
+                case SHUFFLED:
+                    return new ShuffledPlaylistIterator(this);
+                case FAVORITES:
+                    return new FavoritesPlaylistIterator(this, library, userId);
+                default:
+                    return new SimplePlaylistIterator(this);
+            }
+        }
     }
 
     // -------------------- Catalog --------------------
@@ -678,10 +752,21 @@ public class SpotifyFinalLLD {
         }
 
         public void playPlaylist(String userId, String playlistId) {
+            playPlaylist(userId, playlistId, PlaylistIterType.SIMPLE);
+        }
+
+        // Iterator-enabled playlist play
+        public void playPlaylist(String userId, String playlistId, PlaylistIterType type) {
             ensureSubscribed(userId);
+
             Playlist p = playlists.get(playlistId);
             if (p == null) return;
-            playback.session(userId).playContext(p.songIdsView(), 0);
+
+            PlaylistIterator it = p.iterator(type, library, userId);
+            List<String> context = new ArrayList<>();
+            while (it.hasNext()) context.add(it.next());
+
+            playback.session(userId).playContext(context, 0);
         }
 
         public void playAlbum(String userId, String albumId) {
@@ -733,7 +818,7 @@ public class SpotifyFinalLLD {
         }
     }
 
-    // -------------------- Demo (optional) --------------------
+    // -------------------- Demo --------------------
     public static void main(String[] args) {
         InMemoryCatalog catalog = new InMemoryCatalog();
 
@@ -760,6 +845,28 @@ public class SpotifyFinalLLD {
         app.subscribeMonthly(userId, SubscriptionPlan.PREMIUM);
         System.out.println("Charges: " + app.getCharges(userId));
 
+        // Create playlist + add songs
+        Playlist p = app.createPlaylist(userId, "MyPlaylist", true);
+        app.addSongToPlaylist(userId, p.id, "s1");
+        app.addSongToPlaylist(userId, p.id, "s2");
+        app.addSongToPlaylist(userId, p.id, "s3");
+
+        // Like s2 to test FAVORITES iterator
+        app.like(userId, "s2");
+
+        System.out.println("\n--- Play Playlist (SIMPLE) ---");
+        app.playPlaylist(userId, p.id, PlaylistIterType.SIMPLE);
+        app.next(userId);
+
+        System.out.println("\n--- Play Playlist (SHUFFLED) ---");
+        app.playPlaylist(userId, p.id, PlaylistIterType.SHUFFLED);
+        app.next(userId);
+
+        System.out.println("\n--- Play Playlist (FAVORITES) ---");
+        app.playPlaylist(userId, p.id, PlaylistIterType.FAVORITES);
+        app.next(userId);
+
+        // Other demo
         app.playAlbum(userId, "al1");
         app.setShuffle(userId, true);
         app.setRepeat(userId, RepeatMode.ALL);
@@ -768,7 +875,6 @@ public class SpotifyFinalLLD {
         app.queueNext(userId, "s3");
         app.next(userId);
 
-        app.like(userId, "s3");
         System.out.println("Liked: " + app.likedSongs(userId));
         System.out.println("Recent: " + app.recent(userId));
     }

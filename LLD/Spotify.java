@@ -1,21 +1,3 @@
-import java.util.*;
-import java.util.concurrent.ConcurrentHashMap;
-
-/**
- * Spotify LLD - Final (FAANG interview friendly)
- * - Simple domain: Artist, Album, Song, Playlist
- * - Catalog + Search prefix
- * - Library: likes + recents
- * - Subscription:
- *      - Onboarding defaults user to FREE
- *      - Upgrade to paid plans (INDIVIDUAL/FAMILY/STUDENT)
- *      - Different monthly costs per plan
- *      - Must be on a paid plan to play/queue
- * - Playback Session per user:
- *      playSong / playContext / pause / resume / next / prev
- *      Repeat: OFF / ONE / ALL
- * - Shuffle is supported by building SHUFFLED context in Playlist (no PlayOrder)
- */
 public class SpotifyLLD_Final {
 
     // -------------------- Domain --------------------

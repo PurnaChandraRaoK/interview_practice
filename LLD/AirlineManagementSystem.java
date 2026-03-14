@@ -9,6 +9,7 @@ enum FlightType { DOMESTIC, INTERNATIONAL }
 enum PaymentMode { CARD, UPI, NETBANKING }
 enum Role { ADMIN, USER }
 enum BookingStatus { HOLD, CONFIRMED, CANCELLED, EXPIRED }
+enum SeatType { ECONOMY, PREMIUM }
 
 // ---------------- DTOs ----------------
 final class SearchCriteria {
@@ -25,9 +26,9 @@ final class SearchCriteria {
 }
 
 final class TripSearchResult {
-    final String flightId;          // flight number
-    final String tripId;            // unique per (flightId, date, departureTime)
-    final LocalDateTime startTime;  // when trip starts
+    final String flightId;
+    final String tripId;
+    final LocalDateTime startTime;
     final String src, dest;
     final int availableSeatsCount;
 
@@ -39,6 +40,31 @@ final class TripSearchResult {
         this.src = src;
         this.dest = dest;
         this.availableSeatsCount = availableSeatsCount;
+    }
+
+    @Override public String toString() {
+        return "TripSearchResult{flightId=" + flightId +
+                ", tripId=" + tripId +
+                ", startTime=" + startTime +
+                ", src=" + src +
+                ", dest=" + dest +
+                ", availableSeats=" + availableSeatsCount + "}";
+    }
+}
+
+final class SeatInfo {
+    final int seatNo;
+    final SeatType type;
+    final long price; // in smallest unit you choose (e.g., INR)
+
+    SeatInfo(int seatNo, SeatType type, long price) {
+        this.seatNo = seatNo;
+        this.type = Objects.requireNonNull(type);
+        this.price = price;
+    }
+
+    @Override public String toString() {
+        return "SeatInfo{seat=" + seatNo + ", type=" + type + ", price=" + price + "}";
     }
 }
 
@@ -57,36 +83,60 @@ final class User {
 
 // ---------------- Flight Template vs Trip ----------------
 final class FlightTemplate {
-    final String flightId;      // flight number / id
+    final String flightId;            // flight number / id
     final String airlineId;
     final String origin, destination;
     final FlightType type;
     final int totalSeats;
+    final int premiumSeatCount;       // e.g., first N seats are PREMIUM
+    final LocalTime departureTime;
+    final Map<SeatType, Long> priceByType;
 
     FlightTemplate(String flightId, String airlineId, String origin, String destination,
-                   FlightType type, int totalSeats) {
+                   FlightType type, int totalSeats, int premiumSeatCount,
+                   LocalTime departureTime, Map<SeatType, Long> priceByType) {
         this.flightId = Objects.requireNonNull(flightId);
         this.airlineId = Objects.requireNonNull(airlineId);
         this.origin = Objects.requireNonNull(origin);
         this.destination = Objects.requireNonNull(destination);
         this.type = Objects.requireNonNull(type);
         if (totalSeats <= 0) throw new IllegalArgumentException("totalSeats must be > 0");
+        if (premiumSeatCount < 0 || premiumSeatCount > totalSeats)
+            throw new IllegalArgumentException("premiumSeatCount must be between 0 and totalSeats");
+
         this.totalSeats = totalSeats;
+        this.premiumSeatCount = premiumSeatCount;
+        this.departureTime = Objects.requireNonNull(departureTime);
+
+        Objects.requireNonNull(priceByType);
+        if (!priceByType.containsKey(SeatType.ECONOMY))
+            throw new IllegalArgumentException("priceByType must contain ECONOMY price");
+        if (!priceByType.containsKey(SeatType.PREMIUM))
+            throw new IllegalArgumentException("priceByType must contain PREMIUM price");
+        this.priceByType = Map.copyOf(priceByType);
     }
 }
 
-/**
- * Trip instance: Seat state + locking is per trip.
- * Per-seat locking (not one big lock) to avoid blocking other seat operations. [1](https://microsoftapc-my.sharepoint.com/personal/pkota_microsoft_com/_layouts/15/Doc.aspx?sourcedoc=%7BF1DDE633-32F2-46F3-8FC3-70792EF422A0%7D&file=NewLLD%20(1).docx&action=default&mobileredirect=true&DefaultItemOpen=1)
- */
 final class FlightTrip {
     enum SeatState { AVAILABLE, HELD, BOOKED }
 
     static final class SeatRecord {
+        final int seatNo;
+        final SeatType type;
+        final long price;
         final Lock lock = new ReentrantLock();
+
         SeatState state = SeatState.AVAILABLE;
         String heldBy;
         Instant holdUntil;
+
+        SeatRecord(int seatNo, SeatType type, long price) {
+            this.seatNo = seatNo;
+            this.type = type;
+            this.price = price;
+        }
+
+        SeatInfo toInfo() { return new SeatInfo(seatNo, type, price); }
     }
 
     final String tripId;
@@ -100,7 +150,7 @@ final class FlightTrip {
     private final Map<Integer, SeatRecord> seats = new HashMap<>();
     private final AtomicInteger availableCount;
 
-    FlightTrip(FlightTemplate t, LocalDate date, LocalDateTime departureTime) {
+    FlightTrip(FlightTemplate t, LocalDate date) {
         this.flightId = t.flightId;
         this.airlineId = t.airlineId;
         this.origin = t.origin;
@@ -110,7 +160,11 @@ final class FlightTrip {
         this.startTime = LocalDateTime.of(date, t.departureTime);
         this.tripId = buildTripId(t.flightId, this.startTime);
 
-        for (int i = 1; i <= t.totalSeats; i++) seats.put(i, new SeatRecord());
+        for (int i = 1; i <= t.totalSeats; i++) {
+            SeatType seatType = (i <= t.premiumSeatCount) ? SeatType.PREMIUM : SeatType.ECONOMY;
+            long price = t.priceByType.get(seatType);
+            seats.put(i, new SeatRecord(i, seatType, price));
+        }
         this.availableCount = new AtomicInteger(t.totalSeats);
     }
 
@@ -119,118 +173,148 @@ final class FlightTrip {
     }
 
     boolean isSeatValid(int seatNo) { return seats.containsKey(seatNo); }
-
     int availableSeatCount() { return availableCount.get(); }
 
-    /**
-     * Hide locked seats: return only AVAILABLE seats for this trip.
-     */
-    List<Integer> getAvailableSeats() {
-        List<Integer> res = new ArrayList<>();
-        for (Map.Entry<Integer, SeatRecord> e : seats.entrySet()) {
-            int seatNo = e.getKey();
-            SeatRecord r = e.getValue();
+    // ✅ "once customer selects flightId, show seats available for that flight in that trip"
+    // Returns ONLY AVAILABLE seats (HELD/BOOKED hidden), includes type & price.
+    List<SeatInfo> getAvailableSeats() {
+        List<SeatInfo> res = new ArrayList<>();
+        for (SeatRecord r : seats.values()) {
             r.lock.lock();
             try {
                 cleanupExpiredHoldIfNeeded(r);
-                if (r.state == SeatState.AVAILABLE) res.add(seatNo);
+                if (r.state == SeatState.AVAILABLE) res.add(r.toInfo());
             } finally {
                 r.lock.unlock();
             }
         }
-        Collections.sort(res);
+        res.sort(Comparator.comparingInt(s -> s.seatNo));
         return res;
     }
 
-    Instant holdSeat(int seatNo, String userId, Duration ttl) {
-        SeatRecord r = seats.get(seatNo);
-        if (r == null) throw new IllegalArgumentException("Invalid seat: " + seatNo);
+    // Holds multiple seats atomically (either all held or none) and returns total price + holdUntil.
+    HoldResult holdSeats(List<Integer> seatNos, String userId, Duration ttl) {
+        Objects.requireNonNull(seatNos);
+        Objects.requireNonNull(userId);
+        Objects.requireNonNull(ttl);
+        if (seatNos.isEmpty()) throw new IllegalArgumentException("seatNos cannot be empty");
 
-        r.lock.lock();
+        List<Integer> uniqueSorted = seatNos.stream().distinct().sorted().toList();
+
+        // Gather records & validate seat numbers
+        List<SeatRecord> records = new ArrayList<>(uniqueSorted.size());
+        for (int seatNo : uniqueSorted) {
+            SeatRecord r = seats.get(seatNo);
+            if (r == null) throw new IllegalArgumentException("Invalid seat: " + seatNo);
+            records.add(r);
+        }
+
+        // Acquire locks in seatNo order => prevents deadlock
+        for (SeatRecord r : records) r.lock.lock();
         try {
-            cleanupExpiredHoldIfNeeded(r);
+            // First pass: cleanup expiry & validate all seats can be held
+            for (SeatRecord r : records) {
+                cleanupExpiredHoldIfNeeded(r);
+                if (r.state == SeatState.BOOKED)
+                    throw new IllegalStateException("Seat already BOOKED: " + r.seatNo);
+                if (r.state == SeatState.HELD && !userId.equals(r.heldBy))
+                    throw new IllegalStateException("Seat temporarily HELD by another user: " + r.seatNo);
+            }
 
-            if (r.state == SeatState.BOOKED) throw new IllegalStateException("Seat already BOOKED: " + seatNo);
-            if (r.state == SeatState.HELD && !userId.equals(r.heldBy))
-                throw new IllegalStateException("Seat temporarily HELD by another user: " + seatNo);
+            Instant holdUntil = Instant.now().plus(ttl);
+            long total = 0;
 
-            // AVAILABLE -> HELD impacts availableCount
-            if (r.state == SeatState.AVAILABLE) availableCount.decrementAndGet();
+            // Second pass: apply holds
+            for (SeatRecord r : records) {
+                if (r.state == SeatState.AVAILABLE) availableCount.decrementAndGet();
+                r.state = SeatState.HELD;
+                r.heldBy = userId;
+                r.holdUntil = holdUntil;
+                total += r.price;
+            }
 
-            r.state = SeatState.HELD;
-            r.heldBy = userId;
-            r.holdUntil = Instant.now().plus(ttl);
-            return r.holdUntil;
+            return new HoldResult(holdUntil, total, records.stream().map(SeatRecord::toInfo).toList());
         } finally {
-            r.lock.unlock();
+            for (int i = records.size() - 1; i >= 0; i--) records.get(i).lock.unlock();
         }
     }
 
-    void confirmSeat(int seatNo, String userId) {
-        SeatRecord r = seats.get(seatNo);
-        if (r == null) throw new IllegalArgumentException("Invalid seat: " + seatNo);
+    void confirmSeats(List<Integer> seatNos, String userId) {
+        Objects.requireNonNull(seatNos);
+        Objects.requireNonNull(userId);
+        if (seatNos.isEmpty()) throw new IllegalArgumentException("seatNos cannot be empty");
 
-        r.lock.lock();
-        try {
-            cleanupExpiredHoldIfNeeded(r);
-
-            if (r.state != SeatState.HELD) throw new IllegalStateException("Seat not on HOLD: " + seatNo);
-            if (!userId.equals(r.heldBy)) throw new IllegalStateException("HOLD not owned by user: " + seatNo);
-
-            // HELD -> BOOKED (availableCount already decremented at hold time)
-            r.state = SeatState.BOOKED;
-            r.heldBy = null;
-            r.holdUntil = null;
-        } finally {
-            r.lock.unlock();
+        List<Integer> uniqueSorted = seatNos.stream().distinct().sorted().toList();
+        List<SeatRecord> records = new ArrayList<>(uniqueSorted.size());
+        for (int seatNo : uniqueSorted) {
+            SeatRecord r = seats.get(seatNo);
+            if (r == null) throw new IllegalArgumentException("Invalid seat: " + seatNo);
+            records.add(r);
         }
-    }
 
-    void cancelHold(int seatNo, String userId) {
-        SeatRecord r = seats.get(seatNo);
-        if (r == null) return;
-
-        r.lock.lock();
+        for (SeatRecord r : records) r.lock.lock();
         try {
-            cleanupExpiredHoldIfNeeded(r);
-
-            if (r.state == SeatState.HELD && userId.equals(r.heldBy)) {
-                // HELD -> AVAILABLE increments availableCount
-                r.state = SeatState.AVAILABLE;
+            for (SeatRecord r : records) {
+                cleanupExpiredHoldIfNeeded(r);
+                if (r.state != SeatState.HELD) throw new IllegalStateException("Seat not on HOLD: " + r.seatNo);
+                if (!userId.equals(r.heldBy)) throw new IllegalStateException("HOLD not owned by user: " + r.seatNo);
+            }
+            for (SeatRecord r : records) {
+                r.state = SeatState.BOOKED;
                 r.heldBy = null;
                 r.holdUntil = null;
-                availableCount.incrementAndGet();
             }
         } finally {
-            r.lock.unlock();
+            for (int i = records.size() - 1; i >= 0; i--) records.get(i).lock.unlock();
         }
     }
 
-    void cancelConfirmed(int seatNo) {
-        SeatRecord r = seats.get(seatNo);
-        if (r == null) return;
+    void cancelHold(List<Integer> seatNos, String userId) {
+        Objects.requireNonNull(seatNos);
+        Objects.requireNonNull(userId);
+        if (seatNos.isEmpty()) return;
 
-        r.lock.lock();
+        List<Integer> uniqueSorted = seatNos.stream().distinct().sorted().toList();
+        List<SeatRecord> records = new ArrayList<>(uniqueSorted.size());
+        for (int seatNo : uniqueSorted) {
+            SeatRecord r = seats.get(seatNo);
+            if (r != null) records.add(r);
+        }
+
+        for (SeatRecord r : records) r.lock.lock();
         try {
-            if (r.state == SeatState.BOOKED) {
-                // BOOKED -> AVAILABLE increments availableCount
-                r.state = SeatState.AVAILABLE;
-                r.heldBy = null;
-                r.holdUntil = null;
-                availableCount.incrementAndGet();
+            for (SeatRecord r : records) {
+                cleanupExpiredHoldIfNeeded(r);
+                if (r.state == SeatState.HELD && userId.equals(r.heldBy)) {
+                    r.state = SeatState.AVAILABLE;
+                    r.heldBy = null;
+                    r.holdUntil = null;
+                    availableCount.incrementAndGet();
+                }
             }
         } finally {
-            r.lock.unlock();
+            for (int i = records.size() - 1; i >= 0; i--) records.get(i).lock.unlock();
         }
     }
 
     private void cleanupExpiredHoldIfNeeded(SeatRecord r) {
         if (r.state == SeatState.HELD && r.holdUntil != null && Instant.now().isAfter(r.holdUntil)) {
-            // HELD expired -> AVAILABLE increments availableCount
             r.state = SeatState.AVAILABLE;
             r.heldBy = null;
             r.holdUntil = null;
             availableCount.incrementAndGet();
+        }
+    }
+
+    static final class HoldResult {
+        final Instant holdUntil;
+        final long totalPrice;
+        final List<SeatInfo> seats;
+
+        HoldResult(Instant holdUntil, long totalPrice, List<SeatInfo> seats) {
+            this.holdUntil = holdUntil;
+            this.totalPrice = totalPrice;
+            this.seats = seats;
         }
     }
 }
@@ -249,21 +333,25 @@ final class Booking {
     final String bookingId;
     final User user;
     final String tripId;
-    final int seatNumber;
+    final List<SeatInfo> seats;   // ✅ includes type + price
     final Instant holdUntil;
+    final long totalPrice;        // ✅ final booking price (sum of seat prices)
 
     volatile BookingStatus status = BookingStatus.HOLD;
     volatile boolean paid = false;
 
-    Booking(String bookingId, User user, String tripId, int seatNumber, Instant holdUntil) {
+    Booking(String bookingId, User user, String tripId,
+            List<SeatInfo> seats, Instant holdUntil, long totalPrice) {
         this.bookingId = Objects.requireNonNull(bookingId);
         this.user = Objects.requireNonNull(user);
         this.tripId = Objects.requireNonNull(tripId);
-        this.seatNumber = seatNumber;
+        this.seats = List.copyOf(seats);
         this.holdUntil = Objects.requireNonNull(holdUntil);
+        this.totalPrice = totalPrice;
     }
 
     boolean isHoldExpired() { return Instant.now().isAfter(holdUntil); }
+    List<Integer> seatNos() { return seats.stream().map(s -> s.seatNo).toList(); }
 }
 
 // ---------------- Repositories ----------------
@@ -290,7 +378,6 @@ final class InMemoryFlightTripRepo implements FlightTripRepository {
     private final Map<String, FlightTrip> map = new ConcurrentHashMap<>();
     public void addTrip(FlightTrip trip) { map.put(trip.tripId, trip); }
     public Optional<FlightTrip> getTrip(String tripId) { return Optional.ofNullable(map.get(tripId)); }
-
     public List<FlightTrip> searchTrips(SearchCriteria c) {
         List<FlightTrip> res = new ArrayList<>();
         for (FlightTrip t : map.values()) {
@@ -299,7 +386,6 @@ final class InMemoryFlightTripRepo implements FlightTripRepository {
                     && t.date.equals(c.date)
                     && t.type == c.flightType) res.add(t);
         }
-        // sort by start time for nicer search UX
         res.sort(Comparator.comparing(x -> x.startTime));
         return res;
     }
@@ -314,10 +400,17 @@ final class InMemoryBookingRepository implements BookingRepository {
 }
 
 // ---------------- Payment Strategy + Factory ----------------
-interface PaymentStrategy { void pay(String bookingId); }
-final class CardPayment implements PaymentStrategy { public void pay(String bookingId){ System.out.println("Card payment OK for " + bookingId);} }
-final class UpiPayment implements PaymentStrategy { public void pay(String bookingId){ System.out.println("UPI payment OK for " + bookingId);} }
-final class NetBankingPayment implements PaymentStrategy { public void pay(String bookingId){ System.out.println("NetBanking payment OK for " + bookingId);} }
+interface PaymentStrategy { void pay(String bookingId, long amount); }
+
+final class CardPayment implements PaymentStrategy {
+    public void pay(String bookingId, long amount) { System.out.println("Card payment OK for " + bookingId + " amount=" + amount); }
+}
+final class UpiPayment implements PaymentStrategy {
+    public void pay(String bookingId, long amount) { System.out.println("UPI payment OK for " + bookingId + " amount=" + amount); }
+}
+final class NetBankingPayment implements PaymentStrategy {
+    public void pay(String bookingId, long amount) { System.out.println("NetBanking payment OK for " + bookingId + " amount=" + amount); }
+}
 
 final class PaymentFactory {
     private final Map<PaymentMode, PaymentStrategy> map = new EnumMap<>(PaymentMode.class);
@@ -377,58 +470,76 @@ final class AirlineService {
 
     public void registerFlightTemplate(User actor, String flightId, String airlineId,
                                        String origin, String dest, FlightType type,
-                                       int totalSeats) {
+                                       int totalSeats, int premiumSeatCount,
+                                       LocalTime departureTime,
+                                       long economyPrice, long premiumPrice) {
         requireAdmin(actor);
         if (airlineRepo.getAirlineById(airlineId).isEmpty())
             throw new RuntimeException("Airline not found: " + airlineId);
 
-        templateRepo.addTemplate(new FlightTemplate(flightId, airlineId, origin, dest, type, totalSeats));
+        Map<SeatType, Long> priceByType = Map.of(
+                SeatType.ECONOMY, economyPrice,
+                SeatType.PREMIUM, premiumPrice
+        );
+
+        templateRepo.addTemplate(new FlightTemplate(
+                flightId, airlineId, origin, dest, type,
+                totalSeats, premiumSeatCount, departureTime, priceByType
+        ));
     }
 
-    public void createTrip(User actor, String flightId, LocalDate date, LocalTime departureTime) {
+    public void createTrip(User actor, String flightId, LocalDate date) {
         requireAdmin(actor);
         FlightTemplate t = templateRepo.getTemplate(flightId)
                 .orElseThrow(() -> new RuntimeException("Flight template not found: " + flightId));
-        tripRepo.addTrip(new FlightTrip(t, date, departureTime));
+        tripRepo.addTrip(new FlightTrip(t, date));
     }
 
+    // ✅ Search API as requested: flightId, startTime, src, dest, tripId
     public List<TripSearchResult> searchTripsWithAvailability(SearchCriteria c) {
         List<FlightTrip> trips = tripRepo.searchTrips(c);
         List<TripSearchResult> out = new ArrayList<>();
         for (FlightTrip t : trips) {
             out.add(new TripSearchResult(
-                    t.flightId,
-                    t.tripId,
-                    t.startTime,
-                    t.origin,
-                    t.destination,
-                    t.availableSeatCount() // excludes locked seats because AVAILABLE->HELD decrements
+                    t.flightId, t.tripId, t.startTime, t.origin, t.destination, t.availableSeatCount()
             ));
         }
         return out;
     }
 
-    public List<Integer> getAvailableSeats(String tripId) {
+    // ✅ After selecting a tripId, show seats available (with type + price)
+    public List<SeatInfo> getAvailableSeats(String tripId) {
         FlightTrip trip = tripRepo.getTrip(tripId)
                 .orElseThrow(() -> new RuntimeException("Trip not found: " + tripId));
-        return trip.getAvailableSeats(); // hides HELD + BOOKED
+        return trip.getAvailableSeats();
     }
 
-    public Booking holdSeat(User user, String tripId, int seatNo) {
+    // ✅ Hold seats and return Booking with final total price
+    public Booking holdSeats(User user, String tripId, List<Integer> seatNos) {
         FlightTrip trip = tripRepo.getTrip(tripId)
                 .orElseThrow(() -> new RuntimeException("Trip not found: " + tripId));
-        if (!trip.isSeatValid(seatNo)) throw new RuntimeException("Invalid seat: " + seatNo);
 
-        Instant holdUntil = trip.holdSeat(seatNo, user.userId, holdTtl);
-        Booking b = new Booking(UUID.randomUUID().toString(), user, tripId, seatNo, holdUntil);
+        FlightTrip.HoldResult hold = trip.holdSeats(seatNos, user.userId, holdTtl);
+
+        Booking b = new Booking(
+                UUID.randomUUID().toString(),
+                user,
+                tripId,
+                hold.seats,
+                hold.holdUntil,
+                hold.totalPrice
+        );
         bookingRepo.save(b);
-        notifier.publish("Seat " + seatNo + " HELD by " + user.name + " for trip " + tripId);
+
+        notifier.publish("Seats " + seatNos + " HELD by " + user.name +
+                " for trip " + tripId + " totalPrice=" + b.totalPrice);
         return b;
     }
 
     public void payAndConfirm(String bookingId, PaymentMode mode) {
         Booking b = bookingRepo.get(bookingId)
                 .orElseThrow(() -> new RuntimeException("Booking not found: " + bookingId));
+
         if (b.status == BookingStatus.CONFIRMED) return;
         if (b.status != BookingStatus.HOLD) throw new RuntimeException("Cannot pay. Status: " + b.status);
 
@@ -436,27 +547,28 @@ final class AirlineService {
                 .orElseThrow(() -> new RuntimeException("Trip not found: " + b.tripId));
 
         if (b.isHoldExpired()) {
-            trip.cancelHold(b.seatNumber, b.user.userId);
+            trip.cancelHold(b.seatNos(), b.user.userId);
             expire(b);
             throw new RuntimeException("Seat HOLD expired. Please hold again.");
         }
 
         if (!b.paid) {
-            paymentFactory.get(mode).pay(b.bookingId);
+            paymentFactory.get(mode).pay(b.bookingId, b.totalPrice); // ✅ final price used here
             b.paid = true;
         }
 
         try {
-            trip.confirmSeat(b.seatNumber, b.user.userId);
+            trip.confirmSeats(b.seatNos(), b.user.userId);
         } catch (RuntimeException ex) {
-            trip.cancelHold(b.seatNumber, b.user.userId);
+            trip.cancelHold(b.seatNos(), b.user.userId);
             expire(b);
             throw ex;
         }
 
         b.status = BookingStatus.CONFIRMED;
         bookingRepo.save(b);
-        notifier.publish("Booking CONFIRMED: " + bookingId + " for trip " + b.tripId);
+        notifier.publish("Booking CONFIRMED: " + bookingId +
+                " seats=" + b.seatNos() + " totalPrice=" + b.totalPrice);
     }
 
     private void expire(Booking b) {
@@ -471,12 +583,13 @@ final class AirlineService {
 }
 
 // ---------------- Demo ----------------
-public class AirlineSystemMain_SearchAndPerSeatLock {
+public class AirlineSystemMain_SeatTypesAndPrice {
     public static void main(String[] args) throws Exception {
         var airlineRepo = new InMemoryAirlineRepository();
         var templateRepo = new InMemoryFlightTemplateRepo();
         var tripRepo = new InMemoryFlightTripRepo();
         var bookingRepo = new InMemoryBookingRepository();
+
         var notifier = new NotificationService();
         notifier.subscribe(new EmailNotifier());
         notifier.subscribe(new SMSNotifier());
@@ -488,35 +601,42 @@ public class AirlineSystemMain_SearchAndPerSeatLock {
 
         User admin = new User("A0", "Admin", Role.ADMIN);
         service.registerAirline(admin, "A1", "Indigo");
-        service.registerFlightTemplate(admin, "F101", "A1", "Delhi", "Mumbai",
-                FlightType.DOMESTIC, 10, LocalTime.of(9, 30));
+
+        // seat types + different pricing per type
+        service.registerFlightTemplate(
+                admin,
+                "F101",
+                "A1",
+                "Delhi",
+                "Mumbai",
+                FlightType.DOMESTIC,
+                10,
+                3,                      // first 3 seats are PREMIUM
+                LocalTime.of(9, 30),
+                5000,                   // economy price
+                8000                    // premium price
+        );
 
         service.createTrip(admin, "F101", LocalDate.of(2026, 8, 15));
-        service.createTrip(admin, "F101", LocalDate.of(2026, 8, 16));
 
-        // Search -> show details the way you asked
+        // Search
         var results = service.searchTripsWithAvailability(
                 new SearchCriteria("Delhi", "Mumbai", LocalDate.of(2026, 8, 15), FlightType.DOMESTIC)
         );
-        System.out.println("Search results:");
         results.forEach(System.out::println);
 
-        // User selects a flight/trip row => we use tripId (not just flightId)
-        String selectedTripId = results.get(0).tripId;
-        System.out.println("Available seats for selected trip " + selectedTripId + ": " +
-                service.getAvailableSeats(selectedTripId));
+        String tripId = results.get(0).tripId;
 
-        // Concurrency demo: lock seat 1 and seat 2 simultaneously in SAME trip (no global lock bottleneck)
+        // Show available seats with type + price
+        System.out.println("Available seats for trip=" + tripId);
+        System.out.println(service.getAvailableSeats(tripId));
+
+        // Hold seats
         User u1 = new User("U1", "Alice", Role.USER);
-        User u2 = new User("U2", "Bob", Role.USER);
+        Booking b = service.holdSeats(u1, tripId, List.of(1, 5)); // seat1 PREMIUM, seat5 ECONOMY
+        System.out.println("Booking total price = " + b.totalPrice + ", seats=" + b.seats);
 
-        ExecutorService pool = Executors.newFixedThreadPool(2);
-        pool.submit(() -> service.holdSeat(u1, selectedTripId, 1));
-        pool.submit(() -> service.holdSeat(u2, selectedTripId, 2));
-        pool.shutdown();
-        pool.awaitTermination(3, TimeUnit.SECONDS);
-
-        // Locked seats won't appear now
-        System.out.println("Available seats after holds: " + service.getAvailableSeats(selectedTripId));
+        // Pay & confirm
+        service.payAndConfirm(b.bookingId, PaymentMode.UPI);
     }
 }

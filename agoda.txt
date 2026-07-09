@@ -1,0 +1,215 @@
+(how many planes can you prevent from landing, given their initial position and speed) and another one daily temperature in much easier language.
+
+Minimum absolute difference between two elements in an array
+
+Snake & Ladder Matrix Problem (Min Steps to Win the Game)
+
+designing a Hotel Review System that integrates with external APIs(JOBS) to update review ratings and updates search query based on it.
+
+This round was with a Staff Engineer. I was asked to design the High-Level Architecture of a Stock Exchange system.
+I focused on building a high-throughput, low-latency, highly available system. We had a productive discussion, and the interviewer provided hints when I got stuck.
+He was pleased with my solution but suggested I could improve on explaining Non-Functional Requirements in more detail.
+
+tap water array problem
+
+
+Best time to sell stock I & Daily Temperatures
+
+HLD Design a flight search system Basic input params available Price will be available via a 3rd party Each call to 3rd party will bear cost price is dynamic and changes almost realtime
+
+
+A team is doing an analysis of a dual cache performance.
+
+There are n requests in the queue to be processed by a service where the payload size of the iᵗʰ request is denoted by payloadSize[i]. There are two caches A and B in the service which cache the response to requests made.
+
+If the iᵗʰ request is cached by cache A, then cacheA[i] = 1, otherwise 0 for all 1 ≤ i ≤ n
+If the iᵗʰ request is cached by cache B, then cacheB[i] = 1, otherwise 0 for all 1 ≤ i ≤ n
+Find the minimum sum of the payload sizes of a subset of requests in which each cache can serve at least minThreshold requests, or return -1 if they cannot.
+
+
+Example
+Given:
+
+n = 5
+payloadSize = [10, 8, 12, 4, 5, 25]
+cacheA = [1, 0, 1, 1, 0, 1]
+cacheB = [1, 0, 1, 0, 1, 1]
+minThreshold = 3
+It can be seen that both caches can serve 4 requests. If a subset of [1ˢᵗ, 3ʳᵈ, 4ᵗʰ, and 5ᵗʰ] requests are chosen, then:
+
+Cache A can serve [1, 3, 4]ᵗʰ requests
+Cache B can serve [1, 3, 5]ᵗʰ requests
+Hence, the minimum sum of the payload sizes such that both caches can serve minThreshold requests is:
+
+10 + 12 + 4 + 5 = 31
+My solution (passed 5 out of 15 test cases).
+
+public static long getMinimumSize(List<Integer> payloadSize, List<Integer> cacheA, List<Integer> cacheB, int k)
+    {
+        PriorityQueue<Integer> smallestPayloadsServedByA = getSmallestKCacheablePayloads(k, payloadSize, cacheA);
+        PriorityQueue<Integer> smallestPayloadsServedByB = getSmallestKCacheablePayloads(k, payloadSize, cacheB);
+        if(smallestPayloadsServedByA.size() != k || smallestPayloadsServedByB.size() != k)
+            return -1;
+        long result = 0;
+        HashSet<Integer> smallestIndices = new HashSet<Integer>();
+        for(int i = 0; i < k; i++)
+        {
+            smallestIndices.add(smallestPayloadsServedByA.poll());
+            smallestIndices.add(smallestPayloadsServedByB.poll());
+        }
+        for(int smallestIndex : smallestIndices)
+            result += payloadSize.get(smallestIndex);
+        return result;
+    }
+    
+    private static PriorityQueue<Integer> getSmallestKCacheablePayloads(int k, List<Integer> payloadSize, List<Integer> cacheMap)
+    {
+        PriorityQueue<Integer> result = new PriorityQueue<Integer>((x, y) -> payloadSize.get(y) - payloadSize.get(x));
+        for(int i = 0; i < payloadSize.size(); i++)
+        {
+            if(cacheMap.get(i) == 1)
+            {
+                result.add(i);
+                if(result.size() > k)
+                    result.poll();
+            }
+        }
+        return result;
+    }
+	
+	
+	
+	
+	There is an array which contains the speed at which the ith plane is approaching the ground. At each second only one plane can be shot. How much time will be needed to shoot all the planes. If shooting is not possible return -1.
+There is a 2x2 matric of 0 and 1, represneting a maze. Find the shortest length of the path that it has to take to reach the bottom right corner. Movement can only be done toward right or bottom.
+
+
+
+For first question there are lot of data missing. If all plane started from same distance or not and what is the distance, as it will decide if shooting all planes is possible or not.
+ Assuming same distance, possibly we can use maxHeap to find plane with max speed. poll it/shoot it (1 second). decrease distance of next plane by it's speed*time. return time if all planes got shot/ heap is empty. Or return -1 if remaining distance for next plane is 0.
+For second question, we can use dijkstra.
+
+
+
+
+The interview question was based on reconciliation system
+
+Question was like this
+
+Agoda provides APIs to external platform to use Agoda's backend for hotel booking.
+The data is stored at both agoda's end and external platform's end
+
+Schema
+
+Table structure with agoda
+
+activity table
+activity_id
+activity (room bought, bed bought)
+currency
+price
+timestamp
+
+ex ->
+123, room, USD,120, 26th dec
+123, bed, USD, 20, 26th dec
+
+external_platform activity table
+
+offer_id
+activity_id
+activity (room bought, bed bought)
+currency
+price
+timestamp
+
+activity_id has referential integrity in the 2nd table
+
+Needed a reconcile the price at a specific interval and detect any anamoly if there is any and show it to relevant stakeholders
+
+I gave design on it but could not solve lot of edgecases because I had little idea of reconcialiation system
+
+
+
+Question: I dont remember the exact question, but it was like there given two strings s1 and s2 and I need to find the longest palindrome possible from both the string and then merge them and then find the shortest palindrome from the merged string(could'nt find this question anywhere).
+
+Approach: I tried almost everything to solve this and took lot of time but could'nt figure out anything and later I figured out a trick where I merged both the String as it is and then found the shortest palindrome out of the merged string. While i was explaining/coding this up, the interview was very strict that this approach wont work for any of his test case and we wasted a lot of time during the discussion and I finally convinced him that this should work as towards the end we are only botherd about the final shortest palindrom from merged string.
+
+Reassign prioritites
+input: [1,4,8,4] output: [1,2,3,2]
+Solved it with optimal solution
+Find the gap between current and next smallest element
+input: [3,2,1,5] output: [2,1,0,0]
+Solved it in brute force
+
+
+
+
+I was given a list of strings. The task was to return the minimum number of changes required so that no two adjacent characters in any of the strings are the same.
+
+Key Concepts: String manipulation, Greedy algorithm
+
+Approach: I traversed each string and used a greedy strategy to make minimal changes whenever two adjacent characters matched.
+
+Status: ✅ Solved
+
+Question 2: Discounts on Products
+Given a list of products where each product could have 0 or more discounts, and discounts had tags and types (e.g., percentage, flat value, etc.). There could be multiple discounts with the same tag but of different types.
+
+The goal was to find the minimum total cost to buy all the products after applying the most optimal combination of discounts.
+
+Key Concepts: HashMap, Math/Greedy
+
+Approach: I used a map to track the best discount for each tag and applied them optimally to each product.
+
+
+
+
+
+Question 1: There is an array which contains the speed at which the ith plane is approaching the ground. At each second only one plane can be shot. How much time will be needed to shoot all the planes. If shooting is not possible return -1.
+Was able to do it with all edge cases
+
+Question 2:
+Discounts on Products
+Given a list of products where each product could have 0 or more discounts, and discounts had tags and types (e.g., percentage, flat value, etc.). There could be multiple discounts with the same tag but of different types.
+The goal was to find the minimum total cost to buy all the products after applying the most optimal combination of discounts.
+
+
+Problem 1 :
+From what I understood, As there is no j index , I suppose the array is one dimensional containing the speed. If shooting down all planes before they impact is not possible then returning -1 is a requirement. There must be a height from which each plane starts the descent ? And if yes, then sorting according to the time of impact (height / speed) and then trying to match from the first to the last impact one by one greedily to see if we can intercept (traverse the entire sorted time of impact array) the target before impact happens.
+
+Problem 2 :
+Could someone please clarify the question 2 further , if they understood ? OP, could you also clarify if the number of discount coupons was limited
+
+
+
+Given a string s, return the number of palindromic substrings in it.A string is a palindrome when it reads the same backward as forward. A substring is a contiguous sequence of characters within the string.
+
+
+1 <= s.length <= 1000
+s consists of lowercase English letters.
+
+
+
+class Solution {
+    int count;
+    public int countSubstrings(String s) {
+        for(int i=0; i<s.length(); i++) {
+            countPalindrome(s, i, i);
+            countPalindrome(s, i, i+1);
+        }
+        return count;
+    }
+    
+    public void countPalindrome(String s, int l, int r) {
+        while(l >=0 && r <=s.length()-1 && s.charAt(l) == s.charAt(r)) {
+            count++;
+            l--; r++;
+        }
+    }
+}
+
+Design a sim card store system that gives you 3 sim cards on demand and each of them has a 10-digit long phone number.
+- The generated numbers should be very hard to predict.
+- We need to keep track of the phone numbers that are sold out and also the total unused numbers the system has at any point in time.
+- Phone numbers should be stored very efficiently and retrieval of available phone numbers should be fast.
